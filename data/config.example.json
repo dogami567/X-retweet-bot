@@ -15,6 +15,7 @@
     "mode": "retweet",
     "dryRun": true,
     "sendIntervalSec": 5,
+    "translateToZh": false,
     "proxy": "",
     "x": {
       "apiKey": "",

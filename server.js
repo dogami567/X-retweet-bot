@@ -327,6 +327,7 @@ function redactSecrets(obj) {
   const clone = JSON.parse(JSON.stringify(obj ?? {}));
   if (clone?.twitterApi?.apiKey) clone.twitterApi.apiKey = "***";
   if (clone?.forward?.proxy) clone.forward.proxy = "***";
+  if (clone?.forward?.translateToZh !== undefined) clone.forward.translateToZh = Boolean(clone.forward.translateToZh);
   if (clone?.forward?.x?.apiKey) clone.forward.x.apiKey = "***";
   if (clone?.forward?.x?.apiSecret) clone.forward.x.apiSecret = "***";
   if (clone?.forward?.x?.accessToken) clone.forward.x.accessToken = "***";
@@ -380,6 +381,9 @@ function applyEnvOverrides(baseConfig) {
     next.forward.sendIntervalSec = Math.max(0, sendIntervalSec);
   }
 
+  const translateToZh = parseBoolEnv(process.env.FORWARD_TRANSLATE_TO_ZH);
+  if (translateToZh !== undefined && next.forward.translateToZh === undefined) next.forward.translateToZh = translateToZh;
+
   const forwardProxy = safeString(process.env.HTTPS_PROXY || process.env.HTTP_PROXY || process.env.ALL_PROXY).trim();
   if (forwardProxy && !safeString(next.forward.proxy).trim()) next.forward.proxy = forwardProxy;
 
@@ -426,20 +430,21 @@ async function ensureDataFiles() {
   await fs.mkdir(DATA_DIR, { recursive: true });
   await fs.mkdir(DOWNLOAD_DIR, { recursive: true });
 
-  if (!(await fileExists(CONFIG_EXAMPLE_PATH))) {
-    await writeJson(CONFIG_EXAMPLE_PATH, {
-      twitterApi: { baseUrl: "https://api.twitterapi.io", apiKey: "" },
-      monitor: { targets: [], pollIntervalSec: 60, includeReplies: false, includeQuoteTweets: true, skipMentions: false },
-      forward: {
-        enabled: false,
-        mode: "retweet",
-        dryRun: true,
-        sendIntervalSec: 5,
-        proxy: "",
-        x: { apiKey: "", apiSecret: "", accessToken: "", accessSecret: "" },
-      },
-    });
-  }
+	  if (!(await fileExists(CONFIG_EXAMPLE_PATH))) {
+	    await writeJson(CONFIG_EXAMPLE_PATH, {
+	      twitterApi: { baseUrl: "https://api.twitterapi.io", apiKey: "" },
+	      monitor: { targets: [], pollIntervalSec: 60, includeReplies: false, includeQuoteTweets: true, skipMentions: false },
+	      forward: {
+	        enabled: false,
+	        mode: "retweet",
+	        dryRun: true,
+	        sendIntervalSec: 5,
+	        translateToZh: false,
+	        proxy: "",
+	        x: { apiKey: "", apiSecret: "", accessToken: "", accessSecret: "" },
+	      },
+	    });
+	  }
 
   if (!(await fileExists(CONFIG_PATH))) {
     await writeJson(CONFIG_PATH, {});
@@ -454,6 +459,7 @@ const logs = [];
 const stats = {
   apiCalls: 0,
   xCalls: 0,
+  translateCalls: 0,
 };
 
 function addLog(message, extra) {
@@ -679,6 +685,7 @@ async function readPreparedCache(dir) {
 
   const tweetId = safeString(cached?.tweetId).trim();
   const text = safeString(cached?.text).trim();
+  const textZh = safeString(cached?.textZh).trim();
   const photoUrls = Array.isArray(cached?.photoUrls) ? cached.photoUrls.map((u) => safeString(u).trim()).filter(Boolean) : [];
 
   const mediaMeta = Array.isArray(cached?.media) ? cached.media : [];
@@ -702,12 +709,89 @@ async function readPreparedCache(dir) {
   return {
     tweetId,
     text,
+    textZh,
     photoUrls,
     downloadDir: dir,
     media,
     cached: true,
     proxy: redactUrlCredentials(getXProxyUrlFromEnv()),
   };
+}
+
+function containsCjk(text) {
+  return /[\u4e00-\u9fff]/.test(safeString(text));
+}
+
+async function googleTranslateToZh(text, proxyUrl) {
+  const q = safeString(text).trim();
+  if (!q) return "";
+  if (containsCjk(q)) return q;
+
+  const agent = getCachedHttpsProxyAgent(proxyUrl);
+  stats.translateCalls = (stats.translateCalls || 0) + 1;
+  const res = await axios.get("https://translate.googleapis.com/translate_a/single", {
+    params: {
+      client: "gtx",
+      sl: "auto",
+      tl: "zh-CN",
+      dt: "t",
+      q,
+    },
+    timeout: 30_000,
+    validateStatus: () => true,
+    headers: {
+      Accept: "application/json,text/plain,*/*",
+      "User-Agent":
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
+    },
+    ...(agent ? { httpAgent: agent, httpsAgent: agent } : {}),
+  });
+
+  if (res.status < 200 || res.status >= 300) {
+    const err = new Error(`谷歌翻译失败：HTTP ${res.status}`);
+    err.upstream = "google-translate";
+    err.code = Number(res.status) || 0;
+    err.headers = res.headers;
+    err.data = res.data;
+    throw err;
+  }
+
+  let data = res.data;
+  if (typeof data === "string") {
+    try {
+      data = JSON.parse(data);
+    } catch {
+      const err = new Error("谷歌翻译返回非 JSON（可能被拦截/限流）");
+      err.upstream = "google-translate";
+      err.code = 0;
+      err.data = res.data;
+      throw err;
+    }
+  }
+
+  const segments = Array.isArray(data) ? data[0] : null;
+  if (!Array.isArray(segments)) {
+    const err = new Error("谷歌翻译返回结构异常");
+    err.upstream = "google-translate";
+    err.code = 0;
+    err.data = data;
+    throw err;
+  }
+
+  const translated = segments
+    .map((s) => (Array.isArray(s) ? safeString(s[0]) : ""))
+    .join("")
+    .trim();
+
+  if (!translated) {
+    const err = new Error("谷歌翻译结果为空");
+    err.upstream = "google-translate";
+    err.code = 0;
+    err.data = data;
+    throw err;
+  }
+
+  return translated;
 }
 
 function getXRateLimitResetMs(err) {
@@ -863,6 +947,7 @@ async function prepareRepostFromTweet(config, tweetId, fallbackText, options = {
   const requireSourceTweet = options.requireSourceTweet !== undefined ? Boolean(options.requireSourceTweet) : true;
   const strictPhotos = options.strictPhotos !== undefined ? Boolean(options.strictPhotos) : true;
   const proxyUrl = getXProxyUrl(config);
+  const translateToZh = Boolean(config?.forward?.translateToZh);
 
   const dir = path.join(DOWNLOAD_DIR, id);
   if (download) {
@@ -872,7 +957,21 @@ async function prepareRepostFromTweet(config, tweetId, fallbackText, options = {
         const cached = await readPreparedCache(dir);
         const cachedId = safeString(cached?.tweetId).trim();
         if (cachedId && cachedId !== id) throw new Error("prepared.json tweetId 不匹配");
-        return { ...cached, tweetId: id || cachedId };
+        if (!translateToZh) return { ...cached, tweetId: id || cachedId, text: safeString(cached?.text).trim() };
+
+        const cachedZh = safeString(cached?.textZh).trim();
+        if (cachedZh) return { ...cached, tweetId: id || cachedId, text: cachedZh };
+
+        const translated = await googleTranslateToZh(safeString(cached?.text).trim(), proxyUrl);
+        try {
+          const raw = await fs.readFile(preparedPath, "utf8");
+          const meta = JSON.parse(raw);
+          meta.textZh = translated;
+          meta.textZhAt = nowIso();
+          await fs.writeFile(preparedPath, JSON.stringify(meta, null, 2), "utf8");
+          await fs.writeFile(path.join(dir, "text.zh.txt"), translated, "utf8");
+        } catch {}
+        return { ...cached, tweetId: id || cachedId, text: translated, textZh: translated };
       } catch (e) {
         addLog(`[缓存] 读取失败，将重新下载：tweet_id=${id} 错误=${safeString(e?.message || e)}`);
       }
@@ -904,8 +1003,19 @@ async function prepareRepostFromTweet(config, tweetId, fallbackText, options = {
   const usedPhotos = photos.slice(0, 4);
   const photoUrls = usedPhotos.map((p) => p.url);
 
+  let textZh = "";
+  if (translateToZh) {
+    textZh = await googleTranslateToZh(text, proxyUrl);
+  }
+
   if (!download) {
-    return { tweetId: id, text, photoUrls, downloadDir: "", sourceTweet: sourceTweet ? { id: extractTweetId(sourceTweet) } : null };
+    return {
+      tweetId: id,
+      text: translateToZh ? textZh : text,
+      photoUrls,
+      downloadDir: "",
+      sourceTweet: sourceTweet ? { id: extractTweetId(sourceTweet) } : null,
+    };
   }
 
   await fs.mkdir(dir, { recursive: true });
@@ -914,6 +1024,9 @@ async function prepareRepostFromTweet(config, tweetId, fallbackText, options = {
     await fs.writeFile(path.join(dir, "source_tweet.json"), JSON.stringify(sourceTweet, null, 2), "utf8");
   }
   await fs.writeFile(path.join(dir, "text.txt"), text, "utf8");
+  if (translateToZh) {
+    await fs.writeFile(path.join(dir, "text.zh.txt"), textZh, "utf8");
+  }
 
   const downloaded = [];
   for (let i = 0; i < usedPhotos.length; i += 1) {
@@ -955,6 +1068,8 @@ async function prepareRepostFromTweet(config, tweetId, fallbackText, options = {
   const preparedMeta = {
     tweetId: id,
     text,
+    textZh: translateToZh ? textZh : "",
+    textZhAt: translateToZh ? nowIso() : "",
     photoUrls,
     cachedAt: nowIso(),
     sourceTweetId: sourceTweet ? extractTweetId(sourceTweet) : "",
@@ -969,7 +1084,8 @@ async function prepareRepostFromTweet(config, tweetId, fallbackText, options = {
 
   return {
     tweetId: id,
-    text,
+    text: translateToZh ? textZh : text,
+    textZh: translateToZh ? textZh : "",
     photoUrls,
     downloadDir: dir,
     media: downloaded,
@@ -1392,11 +1508,12 @@ async function main() {
     if (incoming?.monitor?.skipMentions !== undefined) next.monitor.skipMentions = Boolean(incoming.monitor.skipMentions);
     if (incoming?.monitor?.includeQuoteTweets !== undefined) next.monitor.includeQuoteTweets = Boolean(incoming.monitor.includeQuoteTweets);
 
-    if (incoming?.forward?.enabled !== undefined) next.forward.enabled = Boolean(incoming.forward.enabled);
-    if (incoming?.forward?.dryRun !== undefined) next.forward.dryRun = Boolean(incoming.forward.dryRun);
-    if (incoming?.forward?.mode) next.forward.mode = safeString(incoming.forward.mode).trim();
-    if (incoming?.forward?.sendIntervalSec !== undefined) next.forward.sendIntervalSec = Math.max(0, Number(incoming.forward.sendIntervalSec || 0));
-    if (incoming?.forward?.proxy !== undefined) next.forward.proxy = safeString(incoming.forward.proxy).trim();
+	    if (incoming?.forward?.enabled !== undefined) next.forward.enabled = Boolean(incoming.forward.enabled);
+	    if (incoming?.forward?.dryRun !== undefined) next.forward.dryRun = Boolean(incoming.forward.dryRun);
+	    if (incoming?.forward?.mode) next.forward.mode = safeString(incoming.forward.mode).trim();
+	    if (incoming?.forward?.sendIntervalSec !== undefined) next.forward.sendIntervalSec = Math.max(0, Number(incoming.forward.sendIntervalSec || 0));
+	    if (incoming?.forward?.translateToZh !== undefined) next.forward.translateToZh = Boolean(incoming.forward.translateToZh);
+	    if (incoming?.forward?.proxy !== undefined) next.forward.proxy = safeString(incoming.forward.proxy).trim();
 
     if (incoming?.forward?.x && typeof incoming.forward.x === "object") {
       next.forward.x = next.forward.x || {};
@@ -1617,22 +1734,23 @@ async function main() {
     res.json({ ok: true, monitor: { running: false } });
   });
 
-  app.post("/api/monitor/run-once", async (_req, res) => {
-    await monitorTick("manual");
-    res.json({ ok: true, message: "已执行一次轮询", stats: { apiCalls: stats.apiCalls, xCalls: stats.xCalls } });
-  });
+	  app.post("/api/monitor/run-once", async (_req, res) => {
+	    await monitorTick("manual");
+	    res.json({ ok: true, message: "已执行一次轮询", stats: { apiCalls: stats.apiCalls, xCalls: stats.xCalls, translateCalls: stats.translateCalls } });
+	  });
 
   app.get("/api/logs", async (_req, res) => {
     res.json({
       logs,
       monitor: { running: monitorRunning },
-      stats: {
-        apiCalls: stats.apiCalls,
-        xCalls: stats.xCalls,
-        queueSize: Array.isArray(db?.queue) ? db.queue.length : 0,
-      },
-    });
-  });
+	      stats: {
+	        apiCalls: stats.apiCalls,
+	        xCalls: stats.xCalls,
+	        translateCalls: stats.translateCalls,
+	        queueSize: Array.isArray(db?.queue) ? db.queue.length : 0,
+	      },
+	    });
+	  });
 
   app.post("/api/logs/clear", async (_req, res) => {
     logs.splice(0, logs.length);

@@ -80,6 +80,7 @@ async function loadConfig() {
   byId("forwardDryRun").checked = config?.forward?.dryRun === undefined ? true : Boolean(config?.forward?.dryRun);
   byId("forwardMode").value = config?.forward?.mode || "retweet";
   byId("forwardSendIntervalSec").value = String(config?.forward?.sendIntervalSec ?? 5);
+  byId("forwardTranslateZh").checked = Boolean(config?.forward?.translateToZh);
   byId("xApiKey").value = config?.forward?.x?.apiKey || "";
   byId("xApiSecret").value = config?.forward?.x?.apiSecret || "";
   byId("xAccessToken").value = config?.forward?.x?.accessToken || "";
@@ -102,6 +103,7 @@ async function saveConfig() {
       dryRun: byId("forwardDryRun").checked,
       mode: byId("forwardMode").value,
       sendIntervalSec: Number.isFinite(forwardSendIntervalSec) ? Math.max(0, forwardSendIntervalSec) : 0,
+      translateToZh: byId("forwardTranslateZh").checked,
       proxy: byId("forwardProxy").value.trim(),
       x: {
         apiKey: byId("xApiKey").value.trim(),
@@ -189,7 +191,7 @@ async function refreshLogs() {
   const lines = (data?.logs || []).map((l) => `[${l.time}] ${l.message}`);
   byId("logBox").textContent = lines.join("\n");
   setStatusBadge(data?.monitor || { running: false });
-  byId("statsBar").textContent = `调用次数：${data?.stats?.apiCalls ?? 0} | X 调用：${data?.stats?.xCalls ?? 0} | 队列：${data?.stats?.queueSize ?? 0}`;
+  byId("statsBar").textContent = `调用次数：${data?.stats?.apiCalls ?? 0} | X 调用：${data?.stats?.xCalls ?? 0} | 翻译：${data?.stats?.translateCalls ?? 0} | 队列：${data?.stats?.queueSize ?? 0}`;
 }
 
 function bind(id, event, handler) {
