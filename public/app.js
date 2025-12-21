@@ -74,6 +74,7 @@ async function loadConfig() {
   byId("apiKey").value = config?.twitterApi?.apiKey || "";
   byId("targets").value = (config?.monitor?.targets || []).join("\n");
   byId("pollIntervalSec").value = String(config?.monitor?.pollIntervalSec ?? 60);
+  byId("fetchLimit").value = String(config?.monitor?.fetchLimit ?? 20);
   byId("skipMentions").checked = Boolean(config?.monitor?.skipMentions);
   byId("skipQuotes").checked = config?.monitor?.includeQuoteTweets === false;
   byId("forwardEnabled").checked = Boolean(config?.forward?.enabled);
@@ -91,13 +92,15 @@ async function loadConfig() {
 async function saveConfig() {
   const targets = parseTargets(byId("targets").value);
   const pollIntervalSec = Number(byId("pollIntervalSec").value || 60);
+  const fetchLimitRaw = Number(byId("fetchLimit").value || 20);
+  const fetchLimit = Number.isFinite(fetchLimitRaw) ? Math.max(1, Math.round(fetchLimitRaw)) : 20;
   const skipMentions = byId("skipMentions").checked;
   const includeQuoteTweets = !byId("skipQuotes").checked;
   const forwardSendIntervalSec = Number(byId("forwardSendIntervalSec").value || 0);
 
   const payload = {
     twitterApi: { apiKey: byId("apiKey").value.trim() },
-    monitor: { targets, pollIntervalSec, skipMentions, includeQuoteTweets },
+    monitor: { targets, pollIntervalSec, fetchLimit, skipMentions, includeQuoteTweets },
     forward: {
       enabled: byId("forwardEnabled").checked,
       dryRun: byId("forwardDryRun").checked,

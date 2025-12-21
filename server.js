@@ -353,13 +353,18 @@ function applyEnvOverrides(baseConfig) {
     next.monitor.targets = parseListEnv(targetsRaw).map(normalizeScreenName).filter(Boolean);
   }
 
-  const pollIntervalSec = parseIntEnv(process.env.MONITOR_POLL_INTERVAL_SEC);
-  if (pollIntervalSec !== undefined && (next.monitor.pollIntervalSec === undefined || next.monitor.pollIntervalSec === null)) {
-    next.monitor.pollIntervalSec = Math.max(10, pollIntervalSec);
-  }
+	  const pollIntervalSec = parseIntEnv(process.env.MONITOR_POLL_INTERVAL_SEC);
+	  if (pollIntervalSec !== undefined && (next.monitor.pollIntervalSec === undefined || next.monitor.pollIntervalSec === null)) {
+	    next.monitor.pollIntervalSec = Math.max(10, pollIntervalSec);
+	  }
 
-  const includeReplies = parseBoolEnv(process.env.MONITOR_INCLUDE_REPLIES);
-  if (includeReplies !== undefined && next.monitor.includeReplies === undefined) next.monitor.includeReplies = includeReplies;
+	  const fetchLimit = parseIntEnv(process.env.MONITOR_FETCH_LIMIT);
+	  if (fetchLimit !== undefined && (next.monitor.fetchLimit === undefined || next.monitor.fetchLimit === null)) {
+	    next.monitor.fetchLimit = Math.max(1, fetchLimit);
+	  }
+
+	  const includeReplies = parseBoolEnv(process.env.MONITOR_INCLUDE_REPLIES);
+	  if (includeReplies !== undefined && next.monitor.includeReplies === undefined) next.monitor.includeReplies = includeReplies;
 
   const includeQuoteTweets = parseBoolEnv(process.env.MONITOR_INCLUDE_QUOTE_TWEETS);
   if (includeQuoteTweets !== undefined && next.monitor.includeQuoteTweets === undefined) next.monitor.includeQuoteTweets = includeQuoteTweets;
@@ -433,7 +438,7 @@ async function ensureDataFiles() {
 	  if (!(await fileExists(CONFIG_EXAMPLE_PATH))) {
 	    await writeJson(CONFIG_EXAMPLE_PATH, {
 	      twitterApi: { baseUrl: "https://api.twitterapi.io", apiKey: "" },
-	      monitor: { targets: [], pollIntervalSec: 60, includeReplies: false, includeQuoteTweets: true, skipMentions: false },
+	      monitor: { targets: [], pollIntervalSec: 60, fetchLimit: 20, includeReplies: false, includeQuoteTweets: true, skipMentions: false },
 	      forward: {
 	        enabled: false,
 	        mode: "retweet",
@@ -494,14 +499,17 @@ function formatAxiosError(err) {
   return safeString(err.message || err);
 }
 
-async function twitterGetLastTweets(config, userName) {
+async function twitterGetLastTweets(config, userName, cursor) {
   const client = createTwitterClient(config);
   stats.apiCalls += 1;
+  const params = {
+    userName,
+    includeReplies: Boolean(config?.monitor?.includeReplies),
+  };
+  const c = safeString(cursor).trim();
+  if (c) params.cursor = c;
   const res = await client.get("/twitter/user/last_tweets", {
-    params: {
-      userName,
-      includeReplies: Boolean(config?.monitor?.includeReplies),
-    },
+    params,
   });
   return res;
 }
@@ -1116,6 +1124,12 @@ let monitorTimer = null;
 let monitorRunning = false;
 let monitorTickInProgress = false;
 
+let queueTimer = null;
+let queueInProgress = false;
+
+let xRateLimitUntilMs = 0;
+let xRateLimitLastLogMs = 0;
+
 function getTargetsFromConfig() {
   const targets = Array.isArray(config?.monitor?.targets) ? config.monitor.targets : [];
   return targets.map(normalizeScreenName).filter(Boolean);
@@ -1158,8 +1172,11 @@ function computeBackoffSeconds(attempts) {
 }
 
 async function processQueue() {
-  if (!Array.isArray(db.queue)) db.queue = [];
-  if (db.queue.length === 0) return;
+  if (queueInProgress) return;
+  queueInProgress = true;
+  try {
+    if (!Array.isArray(db.queue)) db.queue = [];
+    if (db.queue.length === 0) return;
 
   const activeTargets = new Set(getTargetsFromConfig());
   if (activeTargets.size) {
@@ -1186,6 +1203,15 @@ async function processQueue() {
   const mode = safeString(forward.mode || "retweet").trim().toLowerCase();
   const sendIntervalSecRaw = Number(forward.sendIntervalSec ?? 5);
   const sendIntervalMs = Number.isFinite(sendIntervalSecRaw) ? Math.max(0, Math.round(sendIntervalSecRaw * 1000)) : 5000;
+
+  if (enabled && !dryRun && xRateLimitUntilMs > now) {
+    const remaining = Math.max(1, Math.ceil((xRateLimitUntilMs - now) / 1000));
+    if (now - xRateLimitLastLogMs > 15_000) {
+      addLog(`[队列] X 命中限流，暂停处理 ${remaining}s`);
+      xRateLimitLastLogMs = now;
+    }
+    return;
+  }
 
   let xClient = null;
   let xLoggedUserId = "";
@@ -1316,6 +1342,17 @@ async function processQueue() {
       item.nextAttemptAt = schedule.nextAttemptAt;
       addLog(`[转发失败] tweet_id=${tweetId} attempts=${item.attempts} 下次重试=${schedule.delaySeconds}s 错误=${item.lastError}`);
 
+      const upstream = safeString(e?.upstream).trim().toLowerCase();
+      const code = Number(e?.code || e?.statusCode || e?.status) || 0;
+      const isXRateLimit = !upstream && (code === 420 || code === 429 || e?.rateLimitError === true);
+      if (isXRateLimit) {
+        const until = Date.parse(schedule.nextAttemptAt || "") || now + Math.max(1, schedule.delaySeconds) * 1000;
+        xRateLimitUntilMs = Math.max(xRateLimitUntilMs, until);
+        xRateLimitLastLogMs = now;
+        addLog(`[队列] 命中 X 限流，暂停处理到 ${new Date(xRateLimitUntilMs).toLocaleString()}`);
+        break;
+      }
+
       if (item.attempts >= QUEUE_MAX_ATTEMPTS) {
         addLog(`[放弃转发] 超过最大重试次数：tweet_id=${tweetId}`);
         pushFailed(target, tweetId);
@@ -1326,6 +1363,9 @@ async function processQueue() {
   }
 
   await writeJson(DB_PATH, db);
+  } finally {
+    queueInProgress = false;
+  }
 }
 
 async function monitorTick(trigger) {
@@ -1347,40 +1387,72 @@ async function monitorTick(trigger) {
 
     if (!Array.isArray(db.queue)) db.queue = [];
 
-    for (const target of targets) {
-      ensureTargetDb(target);
-      const lastSeen = db.targets[target].lastSeenId || "0";
-
-      addLog(`[轮询] 正在抓取 @${target} 的最新推文...`);
-      let res;
-      try {
-        res = await twitterGetLastTweets(config, target);
-      } catch (e) {
-        addLog(`[轮询] 请求失败：@${target} 错误=${formatAxiosError(e)}`);
-        continue;
-      }
-
-      if (res.status === 401) {
-        addLog("[轮询] API Key 无效或未授权（401）");
-        continue;
-      }
-      if (res.status === 429) {
-        addLog("[轮询] 命中限流（429），稍后再试");
-        continue;
-      }
-      if (res.status < 200 || res.status >= 300) {
-        addLog(`[轮询] HTTP ${res.status}：@${target} ${safeString(res.data?.msg || res.data?.message)}`);
-        continue;
-      }
-      if (res.data?.status && res.data.status !== "success") {
-        addLog(`[轮询] API 返回 error：@${target} ${safeString(res.data?.msg || res.data?.message)}`);
-        continue;
-      }
-
-      const tweets = extractTweetArrayFromApiResponse(res.data);
-      const pinnedTweetId = extractPinnedTweetIdFromApiResponse(res.data);
-      const ids = tweets.map(extractTweetId).filter(Boolean);
-      const newestId = maxId(ids);
+	    for (const target of targets) {
+	      ensureTargetDb(target);
+	      const lastSeen = db.targets[target].lastSeenId || "0";
+	
+	      const fetchLimitRaw = Number(config?.monitor?.fetchLimit ?? 20);
+	      const fetchLimit = Number.isFinite(fetchLimitRaw) ? Math.min(200, Math.max(1, Math.round(fetchLimitRaw))) : 20;
+	      const maxPages = Math.min(20, Math.max(1, Math.ceil(fetchLimit / 20)));
+	
+	      addLog(`[轮询] 正在抓取 @${target} 的最新推文...`);
+	
+	      const tweets = [];
+	      const seenIds = new Set();
+	      let pinnedTweetId = "";
+	      let newestId = "0";
+	      let cursor = "";
+	      let stopBecauseSeen = false;
+	
+	      for (let page = 0; page < maxPages && tweets.length < fetchLimit && !stopBecauseSeen; page += 1) {
+	        let res;
+	        try {
+	          // eslint-disable-next-line no-await-in-loop
+	          res = await twitterGetLastTweets(config, target, cursor);
+	        } catch (e) {
+	          addLog(`[轮询] 请求失败：@${target} 错误=${formatAxiosError(e)}`);
+	          break;
+	        }
+	
+	        if (res.status === 401) {
+	          addLog("[轮询] API Key 无效或未授权（401）");
+	          break;
+	        }
+	        if (res.status === 429) {
+	          addLog("[轮询] 命中限流（429），稍后再试");
+	          break;
+	        }
+	        if (res.status < 200 || res.status >= 300) {
+	          addLog(`[轮询] HTTP ${res.status}：@${target} ${safeString(res.data?.msg || res.data?.message)}`);
+	          break;
+	        }
+	        if (res.data?.status && res.data.status !== "success") {
+	          addLog(`[轮询] API 返回 error：@${target} ${safeString(res.data?.msg || res.data?.message)}`);
+	          break;
+	        }
+	
+	        if (!pinnedTweetId) pinnedTweetId = extractPinnedTweetIdFromApiResponse(res.data);
+	
+	        const pageTweets = extractTweetArrayFromApiResponse(res.data);
+	        for (const t of pageTweets) {
+	          const id = extractTweetId(t);
+	          if (!id) continue;
+	          if (seenIds.has(id)) continue;
+	          seenIds.add(id);
+	          tweets.push(t);
+	          if (compareNumericStrings(id, newestId) > 0) newestId = id;
+	          if (lastSeen && compareNumericStrings(id, lastSeen) <= 0) {
+	            stopBecauseSeen = true;
+	            break;
+	          }
+	          if (tweets.length >= fetchLimit) break;
+	        }
+	
+	        const hasNext = res.data?.has_next_page === true;
+	        const nextCursor = safeString(res.data?.next_cursor).trim();
+	        if (!hasNext || !nextCursor) break;
+	        cursor = nextCursor;
+	      }
 
       const newTweets = tweets
         .map((t) => ({ tweet: t, id: extractTweetId(t) }))
@@ -1455,28 +1527,42 @@ async function monitorTick(trigger) {
       await writeJson(DB_PATH, db);
     }
 
-    await processQueue();
-  } finally {
-    monitorTickInProgress = false;
-  }
-}
+	  } finally {
+	    monitorTickInProgress = false;
+	  }
+	}
 
-function startMonitor() {
-  if (monitorTimer) return;
-  const pollIntervalSec = Math.max(10, Number(config?.monitor?.pollIntervalSec || 60));
-  monitorTimer = setInterval(() => {
-    monitorTick("timer").catch((e) => addLog(`[监控] Tick 异常：${safeString(e?.message || e)}`));
-  }, pollIntervalSec * 1000);
-  monitorRunning = true;
-  addLog(`[监控] 已启动，间隔 ${pollIntervalSec}s`);
-}
+	function startQueueWorker() {
+	  if (queueTimer) return;
+	  queueTimer = setInterval(() => {
+	    processQueue().catch((e) => addLog(`[队列] 处理异常：${safeString(e?.message || e)}`));
+	  }, 2000);
+	}
 
-function stopMonitor() {
-  if (monitorTimer) clearInterval(monitorTimer);
-  monitorTimer = null;
-  monitorRunning = false;
-  addLog("[监控] 已停止");
-}
+	function stopQueueWorker() {
+	  if (queueTimer) clearInterval(queueTimer);
+	  queueTimer = null;
+	}
+
+	function startMonitor() {
+	  if (monitorTimer) return;
+	  const pollIntervalSec = Math.max(10, Number(config?.monitor?.pollIntervalSec || 60));
+	  monitorTimer = setInterval(() => {
+	    monitorTick("timer").catch((e) => addLog(`[监控] Tick 异常：${safeString(e?.message || e)}`));
+	  }, pollIntervalSec * 1000);
+	  monitorRunning = true;
+	  startQueueWorker();
+	  processQueue().catch((e) => addLog(`[队列] 处理异常：${safeString(e?.message || e)}`));
+	  addLog(`[监控] 已启动，间隔 ${pollIntervalSec}s`);
+	}
+
+	function stopMonitor() {
+	  if (monitorTimer) clearInterval(monitorTimer);
+	  monitorTimer = null;
+	  monitorRunning = false;
+	  stopQueueWorker();
+	  addLog("[监控] 已停止");
+	}
 
 async function main() {
   await ensureDataFiles();
@@ -1503,10 +1589,11 @@ async function main() {
     if (incoming?.twitterApi?.apiKey !== undefined) next.twitterApi.apiKey = safeString(incoming.twitterApi.apiKey).trim();
     if (incoming?.twitterApi?.baseUrl) next.twitterApi.baseUrl = safeString(incoming.twitterApi.baseUrl).trim();
 
-    if (Array.isArray(incoming?.monitor?.targets)) next.monitor.targets = incoming.monitor.targets.map(normalizeScreenName).filter(Boolean);
-    if (incoming?.monitor?.pollIntervalSec !== undefined) next.monitor.pollIntervalSec = Math.max(10, Number(incoming.monitor.pollIntervalSec || 60));
-    if (incoming?.monitor?.skipMentions !== undefined) next.monitor.skipMentions = Boolean(incoming.monitor.skipMentions);
-    if (incoming?.monitor?.includeQuoteTweets !== undefined) next.monitor.includeQuoteTweets = Boolean(incoming.monitor.includeQuoteTweets);
+	    if (Array.isArray(incoming?.monitor?.targets)) next.monitor.targets = incoming.monitor.targets.map(normalizeScreenName).filter(Boolean);
+	    if (incoming?.monitor?.pollIntervalSec !== undefined) next.monitor.pollIntervalSec = Math.max(10, Number(incoming.monitor.pollIntervalSec || 60));
+	    if (incoming?.monitor?.fetchLimit !== undefined) next.monitor.fetchLimit = Math.min(200, Math.max(1, Number(incoming.monitor.fetchLimit || 20)));
+	    if (incoming?.monitor?.skipMentions !== undefined) next.monitor.skipMentions = Boolean(incoming.monitor.skipMentions);
+	    if (incoming?.monitor?.includeQuoteTweets !== undefined) next.monitor.includeQuoteTweets = Boolean(incoming.monitor.includeQuoteTweets);
 
 	    if (incoming?.forward?.enabled !== undefined) next.forward.enabled = Boolean(incoming.forward.enabled);
 	    if (incoming?.forward?.dryRun !== undefined) next.forward.dryRun = Boolean(incoming.forward.dryRun);
@@ -1736,7 +1823,12 @@ async function main() {
 
 	  app.post("/api/monitor/run-once", async (_req, res) => {
 	    await monitorTick("manual");
-	    res.json({ ok: true, message: "已执行一次轮询", stats: { apiCalls: stats.apiCalls, xCalls: stats.xCalls, translateCalls: stats.translateCalls } });
+	    await processQueue();
+	    res.json({
+	      ok: true,
+	      message: "已执行一次轮询",
+	      stats: { apiCalls: stats.apiCalls, xCalls: stats.xCalls, translateCalls: stats.translateCalls, queueSize: Array.isArray(db?.queue) ? db.queue.length : 0 },
+	    });
 	  });
 
   app.get("/api/logs", async (_req, res) => {

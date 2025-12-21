@@ -54,6 +54,12 @@
                   <input class="form-control" type="number" id="pollIntervalSec" min="10" value="60" />
                 </div>
 
+                <div class="col-12 col-md-2">
+                  <label class="form-label">每次抓取条数（上限）</label>
+                  <input class="form-control" type="number" id="fetchLimit" min="1" value="20" />
+                  <div class="form-text">接口单次默认返回 20 条；大于 20 会自动翻页（调用次数也会增加）。</div>
+                </div>
+
                 <div class="col-12 col-md-2 d-grid">
                   <button type="submit" class="btn btn-primary" id="btnSaveConfig">保存配置</button>
                 </div>

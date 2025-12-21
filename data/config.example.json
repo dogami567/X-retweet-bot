@@ -6,6 +6,7 @@
   "monitor": {
     "targets": [],
     "pollIntervalSec": 60,
+    "fetchLimit": 20,
     "includeReplies": false,
     "includeQuoteTweets": true,
     "skipMentions": false
