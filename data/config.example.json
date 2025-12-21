@@ -1,0 +1,26 @@
+{
+  "twitterApi": {
+    "baseUrl": "https://api.twitterapi.io",
+    "apiKey": ""
+  },
+  "monitor": {
+    "targets": [],
+    "pollIntervalSec": 60,
+    "includeReplies": false,
+    "includeQuoteTweets": true,
+    "skipMentions": false
+  },
+  "forward": {
+    "enabled": false,
+    "mode": "retweet",
+    "dryRun": true,
+    "sendIntervalSec": 5,
+    "proxy": "",
+    "x": {
+      "apiKey": "",
+      "apiSecret": "",
+      "accessToken": "",
+      "accessSecret": ""
+    }
+  }
+}

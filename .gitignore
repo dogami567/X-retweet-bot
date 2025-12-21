@@ -1,0 +1,17 @@
+node_modules/
+data/config.json
+data/monitor_db.json
+data/downloads/
+dist/
+dist-exe/
+X-get2put/
+.DS_Store
+.idea/
+.vscode/
+AGENTS.md
+.env
+X-get2put-package.zip
+X-get2put-exe.zip
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*

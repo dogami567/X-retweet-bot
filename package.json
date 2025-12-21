@@ -1,0 +1,32 @@
+{
+  "name": "x-get2put",
+  "version": "0.1.0",
+  "private": true,
+  "description": "TwitterAPI.io 监控与转发系统（本地测试面板 + 轮询监控）",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js",
+    "build:exe": "pkg server.js --config package.json --targets node18-win-x64 --output dist-exe/X-get2put.exe",
+    "package:exe": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/package-exe.ps1",
+    "release:exe": "npm run build:exe && npm run package:exe",
+    "core-test": "node scripts/core-test.mjs",
+    "smoke": "node scripts/smoke-test.mjs"
+  },
+  "dependencies": {
+    "axios": "^1.11.0",
+    "cors": "^2.8.5",
+    "dotenv": "^17.2.0",
+    "express": "^4.21.2",
+    "https-proxy-agent": "^7.0.6",
+    "twitter-api-v2": "^1.28.0"
+  },
+  "devDependencies": {
+    "pkg": "^5.8.1"
+  },
+  "pkg": {
+    "assets": [
+      "public/**/*"
+    ]
+  }
+}
