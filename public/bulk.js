@@ -51,6 +51,8 @@ let selectedCaptionIndex = -1;
 let uploadPreviewObjectUrls = [];
 let autoUploadTimer = null;
 let uploadInProgress = false;
+let lastGalleryCount = null;
+let lastGalleryDir = "";
 
 function getSelectedAccount() {
   return (config.accounts || []).find((a) => a.id === selectedAccountId) || null;
@@ -645,6 +647,57 @@ function renderStatusTable(accounts) {
     .join("");
 }
 
+function renderErrorTable(accounts) {
+  const tbody = byId("errorTableBody");
+  const badge = byId("errorCountBadge");
+
+  const list = Array.isArray(accounts) ? accounts : [];
+  const errors = list
+    .filter((a) => String(a?.state?.lastError || "").trim())
+    .map((a) => ({
+      id: a.id || "",
+      name: a.name || a.id || "",
+      at: a.state?.lastErrorAt || "",
+      err: String(a.state?.lastError || "").trim(),
+    }));
+
+  if (badge) {
+    const n = errors.length;
+    badge.textContent = String(n);
+    badge.style.display = n > 0 ? "inline-block" : "none";
+  }
+
+  if (!tbody) return;
+
+  if (errors.length === 0) {
+    tbody.innerHTML = `<tr><td colspan="3" class="text-secondary text-center p-3">暂无报错</td></tr>`;
+    return;
+  }
+
+  errors.sort((a, b) => String(b.at || "").localeCompare(String(a.at || "")));
+
+  tbody.innerHTML = errors
+    .map((e) => {
+      const timeText = e.at ? new Date(e.at).toLocaleString() : "-";
+      const short = e.err.length > 160 ? `${e.err.slice(0, 160)}…` : e.err;
+      return `<tr data-id="${escapeHtml(e.id)}" style="cursor:pointer;">
+        <td class="ps-3 fw-medium">${escapeHtml(e.name)}</td>
+        <td class="mono text-muted" style="font-size: 11px;">${escapeHtml(timeText)}</td>
+        <td class="text-danger" title="${escapeHtml(e.err)}">${escapeHtml(short)}</td>
+      </tr>`;
+    })
+    .join("");
+
+  tbody.querySelectorAll("[data-id]").forEach((tr) => {
+    tr.addEventListener("click", () => {
+      const id = tr.getAttribute("data-id") || "";
+      if (!id) return;
+      selectedAccountId = id;
+      renderAccountsList();
+    });
+  });
+}
+
 async function refreshStatus(options = {}) {
   const silent = options.silent === true;
   const data = await api("/api/bulk/status");
@@ -652,10 +705,20 @@ async function refreshStatus(options = {}) {
 
   setRunningBadge(Boolean(data?.running));
   renderStatusTable(data?.accounts || []);
+  renderErrorTable(data?.accounts || []);
 
   const count = Number(data?.images?.count ?? 0);
   const scannedAt = data?.images?.scannedAt ? new Date(data.images.scannedAt).toLocaleString() : "";
-  setGalleryInfo({ dir: data?.imageDir, scannedAt, count });
+  const dir = data?.imageDir || "";
+  setGalleryInfo({ dir, scannedAt, count });
+
+  // 目录里新增/删除图片时：服务端会更新 count，这里自动刷新图库缩略图
+  const shouldRefreshGallery = (lastGalleryDir && dir && lastGalleryDir !== dir) || (lastGalleryCount !== null && count !== lastGalleryCount);
+  lastGalleryDir = dir;
+  lastGalleryCount = count;
+  if (shouldRefreshGallery) {
+    await refreshImages({ silent: true }).catch(() => {});
+  }
 }
 
 async function clearBulkLogs() {

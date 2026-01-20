@@ -1527,6 +1527,9 @@ const bulkTimers = new Map(); // accountId -> Timeout
 const bulkStates = new Map(); // accountId -> state
 let bulkScanTimer = null;
 let bulkImagesCache = { dir: "", images: [], scannedAt: "" };
+let bulkImageWatcher = null;
+let bulkImageWatchDir = "";
+let bulkImageWatchDebounceTimer = null;
 
 function ensureBulkAccountIds(cfgFile) {
   const next = cfgFile && typeof cfgFile === "object" ? cfgFile : {};
@@ -1558,7 +1561,15 @@ function upsertBulkState(accountId) {
   const id = safeString(accountId).trim();
   if (!id) return null;
   if (!bulkStates.has(id)) {
-    bulkStates.set(id, { running: false, nextPostAt: "", lastPostAt: "", posts: 0, lastError: "", lastTweetId: "" });
+    bulkStates.set(id, {
+      running: false,
+      nextPostAt: "",
+      lastPostAt: "",
+      posts: 0,
+      lastError: "",
+      lastErrorAt: "",
+      lastTweetId: "",
+    });
   }
   return bulkStates.get(id);
 }
@@ -1586,6 +1597,59 @@ function sampleWithoutReplacement(items, count) {
     [arr[i], arr[j]] = [arr[j], arr[i]];
   }
   return arr.slice(0, n);
+}
+
+function uniqueStringList(items) {
+  const arr = Array.isArray(items) ? items : [];
+  const out = [];
+  const seen = new Set();
+  for (const it of arr) {
+    const s = safeString(it).trim();
+    if (!s) continue;
+    if (seen.has(s)) continue;
+    seen.add(s);
+    out.push(s);
+  }
+  return out;
+}
+
+function pickBulkImagesForAccount(state, availableNames, count) {
+  const st = state && typeof state === "object" ? state : {};
+  const available = uniqueStringList(availableNames);
+  const want = Math.max(0, Math.min(4, Math.round(Number(count) || 0)));
+  if (want <= 0 || available.length === 0) return [];
+
+  const availableSet = new Set(available);
+  const usedArr = Array.isArray(st.usedImageNames) ? st.usedImageNames : [];
+  const used = new Set();
+  for (const u of usedArr) {
+    const s = safeString(u).trim();
+    if (!s) continue;
+    if (!availableSet.has(s)) continue;
+    used.add(s);
+  }
+
+  const unused = available.filter((n) => !used.has(n));
+  let picked = [];
+
+  if (unused.length >= want) {
+    picked = sampleWithoutReplacement(unused, want);
+  } else {
+    // 先把本轮剩余未用的用完，再开启下一轮
+    if (unused.length > 0) picked = sampleWithoutReplacement(unused, unused.length);
+    used.clear();
+
+    const need = want - picked.length;
+    if (need > 0) {
+      const pool = available.filter((n) => !picked.includes(n));
+      if (pool.length > 0) picked.push(...sampleWithoutReplacement(pool, Math.min(need, pool.length)));
+    }
+  }
+
+  for (const p of picked) used.add(p);
+  st.usedImageNames = Array.from(used);
+  st.usedImageUpdatedAt = nowIso();
+  return picked;
 }
 
 function computeBulkDelayMs(schedule) {
@@ -1648,6 +1712,49 @@ async function scanBulkImages(trigger) {
   bulkImagesCache = { dir, images, scannedAt: nowIso() };
   if (added > 0) addBulkLog(`[图库] 检测到新增图片：added=${added} trigger=${safeString(trigger || "manual")}`);
   return bulkImagesCache;
+}
+
+function stopBulkImageWatcher() {
+  if (bulkImageWatcher) {
+    try {
+      bulkImageWatcher.close();
+    } catch {}
+  }
+  bulkImageWatcher = null;
+  bulkImageWatchDir = "";
+  if (bulkImageWatchDebounceTimer) clearTimeout(bulkImageWatchDebounceTimer);
+  bulkImageWatchDebounceTimer = null;
+}
+
+function startBulkImageWatcher() {
+  const dir = resolveBulkImageDir(bulkConfig);
+  if (!dir) return;
+
+  const resolved = path.resolve(dir);
+  if (bulkImageWatcher && bulkImageWatchDir === resolved) return;
+
+  stopBulkImageWatcher();
+
+  try {
+    fssync.mkdirSync(resolved, { recursive: true });
+  } catch {}
+
+  try {
+    bulkImageWatcher = fssync.watch(resolved, { persistent: false }, (_eventType, filename) => {
+      const name = safeString(filename).trim();
+      if (name && !isImageFileName(name)) return;
+
+      if (bulkImageWatchDebounceTimer) clearTimeout(bulkImageWatchDebounceTimer);
+      bulkImageWatchDebounceTimer = setTimeout(() => {
+        scanBulkImages("watch").catch(() => {});
+      }, 1200);
+    });
+    bulkImageWatchDir = resolved;
+    addBulkLog(`[图库] 已开启文件夹监控 dir=${resolved}`);
+  } catch (e) {
+    addBulkLog(`[图库] 文件夹监控启动失败：${safeString(e?.message || e)} dir=${resolved}`);
+    stopBulkImageWatcher();
+  }
 }
 
 function startBulkScanTimer() {
@@ -1727,7 +1834,8 @@ async function bulkPostOnce(account, options = {}) {
   const availableNames = images.map((i) => safeString(i?.name).trim()).filter(Boolean);
   const maxPhotos = Math.min(4, availableNames.length);
   const count = Math.max(0, Math.min(maxPhotos, wantCount));
-  const pickedNames = sampleWithoutReplacement(availableNames, count);
+  const pickState = a.dryRun ? { usedImageNames: Array.isArray(state.usedImageNames) ? state.usedImageNames.slice() : [] } : state;
+  const pickedNames = pickBulkImagesForAccount(pickState, availableNames, count);
 
   if (!caption && pickedNames.length === 0) {
     addBulkLog(`[发帖] 跳过：无文案且无图片 account=${safeString(a.name || a.id)}`);
@@ -1841,12 +1949,14 @@ async function bulkTick(accountId, trigger) {
 
   state.running = true;
   state.lastError = "";
+  state.lastErrorAt = "";
   try {
     const result = await bulkPostOnce(a, { trigger });
     if (!result?.skipped) state.posts = Number(state.posts || 0) + 1;
     state.lastPostAt = nowIso();
   } catch (e) {
     state.lastError = safeString(e?.message || e);
+    state.lastErrorAt = nowIso();
     addBulkLog(`[发帖失败] account=${safeString(a.name || a.id)} error=${state.lastError}`);
   } finally {
     state.running = false;
@@ -1876,6 +1986,7 @@ function scheduleBulkNext(accountId, delayMs) {
 function startBulkScheduler() {
   if (bulkRunning) return;
   bulkRunning = true;
+  startBulkImageWatcher();
   startBulkScanTimer();
   scanBulkImages("start").catch(() => {});
 
@@ -2730,6 +2841,7 @@ async function main() {
       bulkConfigFile = ensured2.config;
       await writeJson(BULK_CONFIG_PATH, bulkConfigFile);
       bulkConfig = normalizeBulkConfig(bulkConfigFile);
+      startBulkImageWatcher();
 
       addBulkLog("[配置] 已保存");
 
@@ -2758,7 +2870,7 @@ async function main() {
         proxy: redactUrlCredentials(safeString(a?.proxy).trim()),
         schedule: a?.schedule || {},
         hasCreds,
-        state: state || { running: false, nextPostAt: "", lastPostAt: "", posts: 0, lastError: "", lastTweetId: "" },
+        state: state || { running: false, nextPostAt: "", lastPostAt: "", posts: 0, lastError: "", lastErrorAt: "", lastTweetId: "" },
       };
     });
 
@@ -2794,6 +2906,7 @@ async function main() {
 
     state.running = true;
     state.lastError = "";
+    state.lastErrorAt = "";
     try {
       const result = await bulkPostOnce(a, { trigger: "manual" });
       if (!result?.skipped) state.posts = Number(state.posts || 0) + 1;
@@ -2808,6 +2921,7 @@ async function main() {
       return res.json({ ok: true, result, state });
     } catch (e) {
       state.lastError = safeString(e?.message || e);
+      state.lastErrorAt = nowIso();
       addBulkLog(`[手动] 发帖失败 account=${safeString(a.name || a.id)} error=${state.lastError}`);
       return res.status(502).json({ error: state.lastError, state });
     } finally {
@@ -2855,6 +2969,7 @@ async function main() {
   app.get("/api/bulk/images", async (_req, res) => {
     try {
       const cache = await scanBulkImages("manual");
+      startBulkImageWatcher();
       return res.json({
         ok: true,
         dir: cache.dir,
@@ -2876,6 +2991,7 @@ async function main() {
   app.post("/api/bulk/images/refresh", async (_req, res) => {
     try {
       const cache = await scanBulkImages("refresh");
+      startBulkImageWatcher();
       return res.json({ ok: true, dir: cache.dir, scannedAt: cache.scannedAt, count: (cache.images || []).length });
     } catch (e) {
       const err = safeString(e?.message || e);

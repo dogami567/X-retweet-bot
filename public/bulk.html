@@ -257,6 +257,11 @@
                             <a class="nav-link" data-bs-toggle="tab" href="#tabLogs">日志</a>
                         </li>
                         <li class="nav-item">
+                            <a class="nav-link" data-bs-toggle="tab" href="#tabErrors">
+                                报错 <span class="badge bg-danger ms-1" id="errorCountBadge" style="display:none;"></span>
+                            </a>
+                        </li>
+                        <li class="nav-item">
                             <a class="nav-link" data-bs-toggle="tab" href="#tabApi">调试</a>
                         </li>
                     </ul>
@@ -288,6 +293,22 @@
                                     <button class="btn btn-xs btn-outline-secondary" id="btnClearBulkLogs">Clear</button>
                                 </div>
                                 <pre class="log-box rounded-0 border-0 m-0" id="bulkLogBox" style="height: 300px;"></pre>
+                            </div>
+                        </div>
+                        <div class="tab-pane fade" id="tabErrors">
+                            <div class="table-responsive">
+                                <table class="table table-hover table-sm mb-0 small align-middle">
+                                    <thead class="bg-light">
+                                        <tr>
+                                            <th class="ps-3">Account</th>
+                                            <th style="width: 140px;">Time</th>
+                                            <th>Error</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody id="errorTableBody">
+                                        <tr><td colspan="3" class="text-secondary text-center p-3">暂无报错</td></tr>
+                                    </tbody>
+                                </table>
                             </div>
                         </div>
                         <div class="tab-pane fade" id="tabApi">
