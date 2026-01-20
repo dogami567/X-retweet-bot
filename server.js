@@ -55,6 +55,7 @@ const LOG_LIMIT = 200;
 const BULK_LOG_LIMIT = 200;
 const QUEUE_MAX_ATTEMPTS = 5;
 const X_REQUEST_TIMEOUT_MS = 60_000;
+const BULK_FOLLOW_COMMENTERS_DAILY_LIMIT = 300;
 
 function nowIso() {
   return new Date().toISOString();
@@ -66,6 +67,31 @@ function nowTime() {
   const mm = String(d.getMinutes()).padStart(2, "0");
   const ss = String(d.getSeconds()).padStart(2, "0");
   return `${hh}:${mm}:${ss}`;
+}
+
+function localDateKey(date = new Date()) {
+  const d = date instanceof Date ? date : new Date();
+  const yyyy = String(d.getFullYear());
+  const mm = String(d.getMonth() + 1).padStart(2, "0");
+  const dd = String(d.getDate()).padStart(2, "0");
+  return `${yyyy}-${mm}-${dd}`;
+}
+
+function ensureBulkFollowDailyState(state) {
+  const st = state && typeof state === "object" ? state : {};
+  const today = localDateKey();
+  if (safeString(st.followDailyDate).trim() !== today) {
+    st.followDailyDate = today;
+    st.followDailyCount = 0;
+  }
+  if (!Number.isFinite(Number(st.followDailyCount))) st.followDailyCount = 0;
+  return st;
+}
+
+function getBulkFollowRemaining(state) {
+  const st = ensureBulkFollowDailyState(state);
+  const used = Math.max(0, Math.round(Number(st.followDailyCount) || 0));
+  return Math.max(0, BULK_FOLLOW_COMMENTERS_DAILY_LIMIT - used);
 }
 
 function safeString(value) {
@@ -494,6 +520,7 @@ function normalizeBulkAccount(raw) {
   a.name = safeString(a.name).trim();
   a.enabled = a.enabled === undefined ? true : Boolean(a.enabled);
   a.dryRun = a.dryRun === undefined ? true : Boolean(a.dryRun);
+  a.followCommentersEnabled = a.followCommentersEnabled === true;
   a.proxy = safeString(a.proxy).trim();
 
   a.schedule = a.schedule && typeof a.schedule === "object" ? a.schedule : {};
@@ -745,6 +772,397 @@ async function bulkPostViaPuppeteer(account, text, filePaths) {
   } finally {
     await browser.close();
   }
+}
+
+function normalizeXStatusUrl(rawUrl) {
+  const raw = safeString(rawUrl).trim();
+  if (!raw) return "";
+
+  let url = raw;
+  if (!/^https?:\/\//i.test(url)) url = `https://${url}`;
+
+  url = url.replace(/^https?:\/\/(www\.)?twitter\.com\//i, "https://x.com/");
+  url = url.replace(/^https?:\/\/(www\.)?x\.com\//i, "https://x.com/");
+
+  // 去掉一些常见的尾部符号（复制/粘贴时经常带上）
+  url = url.replace(/[)\],。．…]+$/g, "");
+  return url;
+}
+
+function extractStatusAuthorFromUrl(statusUrl) {
+  const u = safeString(statusUrl).trim();
+  const m = u.match(/x\.com\/([^\/?#]+)\/status\/\d+/i);
+  if (!m) return "";
+  const name = safeString(m[1]).trim();
+  return name && /^[A-Za-z0-9_]{1,50}$/.test(name) ? name : "";
+}
+
+function isLikelyXStatusUrl(statusUrl) {
+  const u = safeString(statusUrl).trim();
+  if (!u) return false;
+  return /x\.com\/[^\/?#]+\/status\/\d+/i.test(u) || /x\.com\/i\/status\/\d+/i.test(u);
+}
+
+function isLoginLikeUrl(url) {
+  const u = safeString(url).toLowerCase();
+  return u.includes("/login") || u.includes("/i/flow/login");
+}
+
+function isBulkFollowStopRequested() {
+  return bulkFollowStopRequested === true;
+}
+
+function resetBulkFollowJob() {
+  bulkFollowJob = {
+    running: false,
+    tweetUrl: "",
+    startedAt: "",
+    finishedAt: "",
+    stopRequested: false,
+    accountsTotal: 0,
+    accountsDone: 0,
+  };
+  bulkFollowStopRequested = false;
+}
+
+function setBulkFollowStopRequested() {
+  bulkFollowStopRequested = true;
+  bulkFollowJob.stopRequested = true;
+}
+
+async function collectCommenterUsernames(page, options = {}) {
+  const opt = options && typeof options === "object" ? options : {};
+  const maxUsers = Math.max(50, Math.min(5000, Math.round(Number(opt.maxUsers) || 500)));
+  const authorToExclude = safeString(opt.excludeAuthor).trim();
+
+  const seen = new Set();
+  let noNewRounds = 0;
+  const maxNoNewRounds = Math.max(3, Math.min(20, Math.round(Number(opt.maxNoNewRounds) || 8)));
+  const maxRounds = Math.max(20, Math.min(800, Math.round(Number(opt.maxRounds) || 240)));
+
+  for (let round = 0; round < maxRounds; round += 1) {
+    if (isBulkFollowStopRequested()) break;
+    if (seen.size >= maxUsers) break;
+
+    // eslint-disable-next-line no-await-in-loop
+    const handles = await page
+      .evaluate((excludeAuthor) => {
+        const banned = new Set([
+          "home",
+          "explore",
+          "search",
+          "i",
+          "settings",
+          "compose",
+          "notifications",
+          "messages",
+          "login",
+          "logout",
+        ]);
+
+        const parseHandleFromHref = (href) => {
+          if (!href || typeof href !== "string") return "";
+          if (!href.startsWith("/")) return "";
+          if (href.startsWith("/i/")) return "";
+          if (href.includes("/status/")) return "";
+
+          const clean = href.split("?")[0].replace(/\/+$/g, "");
+          const parts = clean.split("/").filter(Boolean);
+          if (parts.length !== 1) return "";
+          const h = parts[0];
+          if (!h) return "";
+          if (!/^[A-Za-z0-9_]{1,50}$/.test(h)) return "";
+          if (banned.has(h.toLowerCase())) return "";
+          if (excludeAuthor && h.toLowerCase() === String(excludeAuthor).toLowerCase()) return "";
+          return h;
+        };
+
+        const root = document.querySelector('[data-testid="primaryColumn"]') || document.body;
+        const anchors = Array.from(root.querySelectorAll('article [data-testid="User-Name"] a[href]'));
+        const out = [];
+        for (const a of anchors) {
+          const h = parseHandleFromHref(a.getAttribute("href") || "");
+          if (!h) continue;
+          out.push(h);
+        }
+        return Array.from(new Set(out));
+      }, authorToExclude)
+      .catch(() => []);
+
+    const before = seen.size;
+    for (const h of Array.isArray(handles) ? handles : []) {
+      const s = safeString(h).trim();
+      if (!s) continue;
+      if (seen.size >= maxUsers) break;
+      seen.add(s);
+    }
+
+    if (seen.size === before) noNewRounds += 1;
+    else noNewRounds = 0;
+
+    if (noNewRounds >= maxNoNewRounds) break;
+
+    // eslint-disable-next-line no-await-in-loop
+    await page.evaluate(() => window.scrollBy(0, Math.floor(window.innerHeight * 0.85))).catch(() => {});
+    // eslint-disable-next-line no-await-in-loop
+    await sleep(randomIntInclusive(700, 1400));
+  }
+
+  return Array.from(seen);
+}
+
+async function isProtectedProfilePage(page) {
+  const text = await page
+    .evaluate(() => (document.body ? document.body.innerText || "" : ""))
+    .catch(() => "");
+  const t = String(text || "");
+  return (
+    /These Tweets are protected/i.test(t) ||
+    /Protected Tweets/i.test(t) ||
+    /Only confirmed followers have access/i.test(t) ||
+    /这些推文受保护/i.test(t) ||
+    /推文受保护/i.test(t) ||
+    /受保护的推文/i.test(t) ||
+    /只有经确认的关注者/i.test(t)
+  );
+}
+
+async function followUserFromProfile(page) {
+  const followBtnSel = '[data-testid$="-follow"]';
+  const unfollowBtnSel = '[data-testid$="-unfollow"]';
+
+  const unfollowBtn = await page.$(unfollowBtnSel);
+  if (unfollowBtn) return { status: "already_following" };
+
+  const followBtn = await page.$(followBtnSel);
+  if (!followBtn) return { status: "button_not_found" };
+
+  await followBtn.evaluate((b) => b.scrollIntoView({ block: "center" })).catch(() => {});
+  await sleep(200);
+  await followBtn.click().catch(() => {});
+  await sleep(900);
+
+  const unfollowAfter = await page.$(unfollowBtnSel);
+  if (unfollowAfter) return { status: "followed" };
+
+  // 可能是请求关注（受保护账号）或 UI 未及时刷新：交给上层按 warning 处理
+  return { status: "clicked" };
+}
+
+async function bulkFollowCommentersForAccount(account, tweetUrl, options = {}) {
+  const a = account && typeof account === "object" ? account : null;
+  if (!a) throw new Error("账号不存在");
+
+  const exe = findLocalBrowser();
+  if (!exe) throw new Error("关注需要本地 Chrome/Edge。");
+
+  const profileDirValue = safeString(a?.x?.profileDir).trim();
+  if (!profileDirValue) throw new Error("未绑定浏览器 Profile：请先点“打开浏览器登录”完成登录");
+  const profileDir = resolveAppDirPath(profileDirValue);
+  if (!profileDir) throw new Error("Profile 目录解析失败");
+
+  await fs.mkdir(profileDir, { recursive: true });
+
+  const proxyUrl = getBulkProxyUrl(a);
+  const args = [
+    "--disable-blink-features=AutomationControlled",
+    "--no-first-run",
+    "--no-default-browser-check",
+    "--disable-infobars",
+    "--window-position=0,0",
+    "--window-size=1280,800",
+  ];
+  if (proxyUrl) args.push(`--proxy-server=${proxyUrl}`);
+
+  const browser = await puppeteer.launch({
+    executablePath: exe,
+    headless: false,
+    defaultViewport: null,
+    userDataDir: profileDir,
+    ignoreDefaultArgs: ["--enable-automation"],
+    args,
+  });
+
+  const summary = {
+    ok: true,
+    collected: 0,
+    followed: 0,
+    skipped: 0,
+    warnings: 0,
+    failed: 0,
+  };
+
+  try {
+    const page = await browser.newPage();
+    await page.goto(tweetUrl, { waitUntil: "networkidle2", timeout: 60_000 });
+
+    if (isLoginLikeUrl(page.url())) {
+      throw new Error("未登录：请先点“打开浏览器登录”完成登录");
+    }
+
+    await page.waitForSelector("article", { timeout: 15_000 }).catch(() => {});
+    await sleep(900);
+
+    const remain = Math.max(0, Math.round(Number(options.remain || 0)));
+    const maxToCollect = Math.min(5000, Math.max(600, remain * 3));
+    const authorFromUrl = extractStatusAuthorFromUrl(tweetUrl);
+
+    const handles = await collectCommenterUsernames(page, {
+      maxUsers: maxToCollect,
+      excludeAuthor: authorFromUrl,
+      maxNoNewRounds: 8,
+      maxRounds: 260,
+    });
+
+    summary.collected = handles.length;
+
+    for (const h of handles) {
+      if (isBulkFollowStopRequested()) break;
+
+      const state = upsertBulkState(a.id);
+      ensureBulkFollowDailyState(state);
+      if (getBulkFollowRemaining(state) <= 0) break;
+
+      const username = safeString(h).trim();
+      if (!username) continue;
+
+      const profileUrl = `https://x.com/${username}`;
+      // eslint-disable-next-line no-await-in-loop
+      await page.goto(profileUrl, { waitUntil: "networkidle2", timeout: 60_000 }).catch(() => {});
+
+      // eslint-disable-next-line no-await-in-loop
+      await sleep(randomIntInclusive(800, 1400));
+
+      if (isLoginLikeUrl(page.url())) {
+        throw new Error("未登录：请先点“打开浏览器登录”完成登录");
+      }
+
+      // eslint-disable-next-line no-await-in-loop
+      const protectedProfile = await isProtectedProfilePage(page).catch(() => false);
+      if (protectedProfile) {
+        summary.skipped += 1;
+        summary.warnings += 1;
+        addBulkLog(`[关注][WARN] 受保护账号，跳过 account=${safeString(a.name || a.id)} user=@${username}`);
+        continue;
+      }
+
+      // eslint-disable-next-line no-await-in-loop
+      const r = await followUserFromProfile(page).catch((e) => ({ status: "error", error: safeString(e?.message || e) }));
+
+      if (r.status === "already_following") {
+        summary.skipped += 1;
+        summary.warnings += 1;
+        addBulkLog(`[关注][WARN] 已关注过，跳过 account=${safeString(a.name || a.id)} user=@${username}`);
+        continue;
+      }
+
+      if (r.status === "button_not_found") {
+        summary.skipped += 1;
+        summary.warnings += 1;
+        addBulkLog(`[关注][WARN] 未找到关注按钮，跳过 account=${safeString(a.name || a.id)} user=@${username}`);
+        continue;
+      }
+
+      if (r.status === "followed" || r.status === "clicked") {
+        summary.followed += 1;
+        const state = upsertBulkState(a.id);
+        ensureBulkFollowDailyState(state);
+        state.followDailyCount = Math.max(0, Math.round(Number(state.followDailyCount) || 0)) + 1;
+        addBulkLog(`[关注] 已关注 account=${safeString(a.name || a.id)} user=@${username} today=${state.followDailyCount}/${BULK_FOLLOW_COMMENTERS_DAILY_LIMIT}`);
+
+        // eslint-disable-next-line no-await-in-loop
+        await sleep(randomIntInclusive(1100, 2400));
+        continue;
+      }
+
+      summary.failed += 1;
+      addBulkLog(`[关注] 失败 account=${safeString(a.name || a.id)} user=@${username} error=${safeString(r.error || r.status)}`);
+      // eslint-disable-next-line no-await-in-loop
+      await sleep(randomIntInclusive(900, 1600));
+    }
+
+    return summary;
+  } finally {
+    await browser.close().catch(() => {});
+  }
+}
+
+async function runBulkFollowCommenters(tweetUrl) {
+  const url = normalizeXStatusUrl(tweetUrl);
+  if (!url) throw new Error("缺少 tweetUrl");
+  if (!isLikelyXStatusUrl(url)) throw new Error("链接不合法：请提供 X 推文链接（包含 /status/）");
+
+  if (bulkFollowJob?.running) throw new Error("关注任务正在运行中，请先停止或等待结束");
+
+  bulkFollowStopRequested = false;
+  bulkFollowJob.running = true;
+  bulkFollowJob.stopRequested = false;
+  bulkFollowJob.tweetUrl = url;
+  bulkFollowJob.startedAt = nowIso();
+  bulkFollowJob.finishedAt = "";
+  bulkFollowJob.accountsDone = 0;
+
+  const accounts = getBulkAccounts().filter((a) => Boolean(a?.followCommentersEnabled));
+  bulkFollowJob.accountsTotal = accounts.length;
+
+  addBulkLog(`[关注] 开始 tweet=${url} accounts=${accounts.length} limit=每天每号${BULK_FOLLOW_COMMENTERS_DAILY_LIMIT}`);
+
+  for (const a of accounts) {
+    if (isBulkFollowStopRequested()) break;
+
+    const id = safeString(a?.id).trim();
+    if (!id) continue;
+    const state = upsertBulkState(id);
+    if (!state) continue;
+
+    ensureBulkFollowDailyState(state);
+    state.followRunning = true;
+    state.followLastRunAt = nowIso();
+    state.followLastTweetUrl = url;
+    state.followDone = 0;
+    state.followSkipped = 0;
+    state.followWarnings = 0;
+    state.followFailed = 0;
+    state.followLastError = "";
+    state.followLastErrorAt = "";
+
+    const remain = getBulkFollowRemaining(state);
+    if (remain <= 0) {
+      addBulkLog(`[关注] 今日已达上限，跳过 account=${safeString(a.name || a.id)} today=${state.followDailyCount}/${BULK_FOLLOW_COMMENTERS_DAILY_LIMIT}`);
+      state.followRunning = false;
+      bulkFollowJob.accountsDone += 1;
+      continue;
+    }
+
+    try {
+      // eslint-disable-next-line no-await-in-loop
+      const r = await bulkFollowCommentersForAccount(a, url, { remain });
+      state.followDone = Number(r?.followed || 0);
+      state.followSkipped = Number(r?.skipped || 0);
+      state.followWarnings = Number(r?.warnings || 0);
+      state.followFailed = Number(r?.failed || 0);
+      addBulkLog(
+        `[关注] 完成 account=${safeString(a.name || a.id)} followed=${state.followDone} skipped=${state.followSkipped} warn=${state.followWarnings} failed=${state.followFailed} today=${state.followDailyCount}/${BULK_FOLLOW_COMMENTERS_DAILY_LIMIT}`,
+      );
+    } catch (e) {
+      state.followLastError = safeString(e?.message || e);
+      state.followLastErrorAt = nowIso();
+      addBulkLog(`[关注] 账号执行失败 account=${safeString(a.name || a.id)} error=${state.followLastError}`);
+    } finally {
+      state.followRunning = false;
+      bulkFollowJob.accountsDone += 1;
+    }
+
+    // 每个账号之间稍微停一下，避免密集行为
+    // eslint-disable-next-line no-await-in-loop
+    await sleep(randomIntInclusive(2000, 4500));
+  }
+
+  bulkFollowJob.running = false;
+  bulkFollowJob.finishedAt = nowIso();
+
+  if (isBulkFollowStopRequested()) addBulkLog("[关注] 已停止");
+  else addBulkLog("[关注] 全部账号已完成");
 }
 
 function normalizeBulkConfig(raw) {
@@ -1529,6 +1947,16 @@ let bulkConfigFile = null;
 let bulkRunning = false;
 const bulkTimers = new Map(); // accountId -> Timeout
 const bulkStates = new Map(); // accountId -> state
+let bulkFollowJob = {
+  running: false,
+  tweetUrl: "",
+  startedAt: "",
+  finishedAt: "",
+  stopRequested: false,
+  accountsTotal: 0,
+  accountsDone: 0,
+};
+let bulkFollowStopRequested = false;
 let bulkScanTimer = null;
 let bulkImagesCache = { dir: "", images: [], scannedAt: "" };
 let bulkImageWatcher = null;
@@ -1573,6 +2001,17 @@ function upsertBulkState(accountId) {
       lastError: "",
       lastErrorAt: "",
       lastTweetId: "",
+      followDailyDate: "",
+      followDailyCount: 0,
+      followRunning: false,
+      followLastRunAt: "",
+      followLastTweetUrl: "",
+      followDone: 0,
+      followSkipped: 0,
+      followWarnings: 0,
+      followFailed: 0,
+      followLastError: "",
+      followLastErrorAt: "",
     });
   }
   return bulkStates.get(id);
@@ -2878,16 +3317,37 @@ async function main() {
         name: safeString(a?.name).trim(),
         enabled: Boolean(a?.enabled),
         dryRun: Boolean(a?.dryRun),
+        followCommentersEnabled: Boolean(a?.followCommentersEnabled),
         proxy: redactUrlCredentials(safeString(a?.proxy).trim()),
         schedule: a?.schedule || {},
         hasCreds,
-        state: state || { running: false, nextPostAt: "", lastPostAt: "", posts: 0, lastError: "", lastErrorAt: "", lastTweetId: "" },
+        state: state || {
+          running: false,
+          nextPostAt: "",
+          lastPostAt: "",
+          posts: 0,
+          lastError: "",
+          lastErrorAt: "",
+          lastTweetId: "",
+          followDailyDate: "",
+          followDailyCount: 0,
+          followRunning: false,
+          followLastRunAt: "",
+          followLastTweetUrl: "",
+          followDone: 0,
+          followSkipped: 0,
+          followWarnings: 0,
+          followFailed: 0,
+          followLastError: "",
+          followLastErrorAt: "",
+        },
       };
     });
 
     res.json({
       ok: true,
       running: bulkRunning,
+      followJob: bulkFollowJob,
       imageDir: resolveBulkImageDir(bulkConfig),
       images: { count: Array.isArray(bulkImagesCache?.images) ? bulkImagesCache.images.length : 0, scannedAt: bulkImagesCache?.scannedAt || "" },
       accounts,
@@ -2938,6 +3398,60 @@ async function main() {
     } finally {
       state.running = false;
     }
+  });
+
+  // 关注某条推文下的评论用户（按账号执行，复用浏览器 Profile 登录态）
+  app.post("/api/bulk/follow-commenters/start", async (req, res) => {
+    try {
+      const tweetUrl = safeString(req.body?.tweetUrl).trim();
+      if (!tweetUrl) return res.status(400).json({ error: "缺少 tweetUrl" });
+
+      if (bulkFollowJob?.running) return res.status(409).json({ error: "关注任务正在运行中" });
+
+      const url = normalizeXStatusUrl(tweetUrl);
+      if (!isLikelyXStatusUrl(url)) return res.status(400).json({ error: "链接不合法：请提供 X 推文链接（包含 /status/）" });
+
+      const accounts = getBulkAccounts().filter((a) => Boolean(a?.followCommentersEnabled));
+      if (accounts.length === 0) return res.status(400).json({ error: "没有可执行账号：请在账号里勾选「关注评论」" });
+
+      // 启动后台任务（不阻塞接口）
+      runBulkFollowCommenters(url).catch((e) => {
+        const err = safeString(e?.message || e);
+        addBulkLog(`[关注] 全局任务异常：${err}`);
+        bulkFollowJob.running = false;
+        bulkFollowJob.finishedAt = nowIso();
+      });
+
+      return res.json({ ok: true, job: bulkFollowJob });
+    } catch (e) {
+      const err = safeString(e?.message || e);
+      addBulkLog(`[关注] 启动失败：${err}`);
+      return res.status(500).json({ error: err });
+    }
+  });
+
+  app.post("/api/bulk/follow-commenters/stop", async (_req, res) => {
+    setBulkFollowStopRequested();
+    addBulkLog("[关注] 已请求停止");
+    res.json({ ok: true, job: bulkFollowJob });
+  });
+
+  app.get("/api/bulk/follow-commenters/status", async (_req, res) => {
+    const accounts = getBulkAccounts()
+      .filter((a) => Boolean(a?.followCommentersEnabled))
+      .map((a) => {
+        const id = safeString(a?.id).trim();
+        const st = id ? upsertBulkState(id) : null;
+        ensureBulkFollowDailyState(st);
+        return {
+          id,
+          name: safeString(a?.name).trim(),
+          proxy: redactUrlCredentials(getBulkProxyUrl(a)),
+          profileDir: safeString(a?.x?.profileDir).trim(),
+          state: st || {},
+        };
+      });
+    res.json({ ok: true, job: bulkFollowJob, accounts });
   });
 
   app.post("/api/bulk/test-x-auth", async (req, res) => {

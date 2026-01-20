@@ -99,12 +99,16 @@ function renderAccountsList() {
       const name = a.name || a.id;
       const statusIcon = a.enabled ? `<i class="bi bi-circle-fill text-success" style="font-size: 8px;"></i>` : `<i class="bi bi-circle-fill text-secondary" style="font-size: 8px;"></i>`;
       const dryBadge = a.dryRun ? `<span class="badge bg-warning text-dark ms-1" style="font-size: 9px;">DRY</span>` : "";
+      const followBadge = a.followCommentersEnabled
+        ? `<span class="badge bg-info text-dark ms-1" style="font-size: 9px;" title="该账号会参与“关注评论用户”任务">FOL</span>`
+        : "";
       
       return `<button type="button" class="list-group-item list-group-item-action ${active}" data-id="${escapeHtml(a.id)}">
         <div class="d-flex w-100 justify-content-between align-items-center">
             <div class="text-truncate flex-grow-1 fw-medium" title="${escapeHtml(name)}">${escapeHtml(name)}</div>
             <div class="d-flex align-items-center gap-1 ms-2">
                 ${dryBadge}
+                ${followBadge}
                 ${statusIcon}
             </div>
         </div>
@@ -137,6 +141,7 @@ function renderAccountForm() {
   byId("accName").value = a?.name || "";
   byId("accEnabled").checked = Boolean(a?.enabled);
   byId("accDryRun").checked = a?.dryRun === undefined ? true : Boolean(a?.dryRun);
+  byId("accFollowCommentersEnabled").checked = Boolean(a?.followCommentersEnabled);
   byId("accProxy").value = a?.proxy || "";
 
   byId("accIntervalMin").value = String(a?.schedule?.intervalMin ?? 120);
@@ -166,6 +171,7 @@ function applyAccountFormToConfig() {
   a.name = byId("accName").value.trim();
   a.enabled = byId("accEnabled").checked;
   a.dryRun = byId("accDryRun").checked;
+  a.followCommentersEnabled = byId("accFollowCommentersEnabled").checked;
   a.proxy = byId("accProxy").value.trim();
 
   a.schedule = a.schedule || {};
@@ -359,6 +365,62 @@ async function testXAuth() {
   if (!a) throw new Error("请先选择一个账号");
   const res = await api("/api/bulk/test-x-auth", { method: "POST", body: JSON.stringify({ accountId: a.id }) });
   setJsonBox(res);
+}
+
+function setFollowJobHint(job) {
+  const el = byId("followJobHint");
+  if (!el) return;
+
+  const j = job && typeof job === "object" ? job : {};
+  const running = Boolean(j.running);
+  const stopRequested = Boolean(j.stopRequested);
+  const url = String(j.tweetUrl || "").trim();
+  const startedAt = j.startedAt ? new Date(j.startedAt).toLocaleString() : "";
+  const finishedAt = j.finishedAt ? new Date(j.finishedAt).toLocaleString() : "";
+
+  if (running) {
+    const total = Number(j.accountsTotal ?? 0);
+    const done = Number(j.accountsDone ?? 0);
+    const status = stopRequested ? "运行中（已请求停止）" : "运行中";
+    el.textContent = `状态：${status} | 进度：${done}/${total} | 开始：${startedAt || "-"}`;
+    return;
+  }
+
+  if (finishedAt) {
+    el.textContent = `状态：已结束 | 结束：${finishedAt} | 链接：${url || "-"}`;
+    return;
+  }
+
+  el.textContent = `状态：未开始`;
+}
+
+async function followCommentersStart() {
+  // 确保账号勾选/代理等最新配置已落盘，否则服务端拿到的还是旧配置
+  await saveConfig();
+
+  const tweetUrl = byId("followTweetUrl")?.value?.trim() || "";
+  if (!tweetUrl) throw new Error("请先填写 X 帖子链接");
+
+  const res = await api("/api/bulk/follow-commenters/start", { method: "POST", body: JSON.stringify({ tweetUrl }) });
+  setJsonBox(res);
+  setFollowJobHint(res?.job || res?.followJob || null);
+  await refreshLogs({ silent: true }).catch(() => {});
+  await refreshStatus({ silent: true }).catch(() => {});
+}
+
+async function followCommentersStop() {
+  const res = await api("/api/bulk/follow-commenters/stop", { method: "POST" });
+  setJsonBox(res);
+  await followCommentersStatus({ silent: true }).catch(() => {});
+  await refreshLogs({ silent: true }).catch(() => {});
+}
+
+async function followCommentersStatus(options = {}) {
+  const silent = options.silent === true;
+  const res = await api("/api/bulk/follow-commenters/status");
+  if (!silent) setJsonBox(res);
+  setFollowJobHint(res?.job || null);
+  return res;
 }
 
 async function refreshDebug(options = {}) {
@@ -706,6 +768,7 @@ async function refreshStatus(options = {}) {
   setRunningBadge(Boolean(data?.running));
   renderStatusTable(data?.accounts || []);
   renderErrorTable(data?.accounts || []);
+  setFollowJobHint(data?.followJob || null);
 
   const count = Number(data?.images?.count ?? 0);
   const scannedAt = data?.images?.scannedAt ? new Date(data.images.scannedAt).toLocaleString() : "";
@@ -745,6 +808,7 @@ function bindAccountAutoApply() {
     "accName",
     "accEnabled",
     "accDryRun",
+    "accFollowCommentersEnabled",
     "accProxy",
     "accIntervalMin",
     "accJitterMin",
@@ -770,6 +834,10 @@ bind("btnBulkStart", "click", startBulk);
 bind("btnBulkStop", "click", stopBulk);
 bind("btnTestXAuth", "click", testXAuth);
 bind("btnRunOnce", "click", runOnce);
+
+bind("btnFollowCommentersStart", "click", followCommentersStart);
+bind("btnFollowCommentersStop", "click", followCommentersStop);
+bind("btnFollowCommentersStatus", "click", () => followCommentersStatus({ silent: false }));
 
 bind("btnRefreshImages", "click", () => refreshImages({ silent: false }));
 bind("btnRefreshStatus", "click", () => refreshStatus({ silent: false }));
@@ -816,6 +884,7 @@ bind("btnAddAccount", "click", async () => {
     name: "",
     enabled: true,
     dryRun: true,
+    followCommentersEnabled: false,
     proxy: "",
     schedule: { intervalMin: 120, jitterMin: 10, imagesMin: 1, imagesMax: 4 },
     x: { apiKey: "", apiSecret: "", accessToken: "", accessSecret: "", profileDir: "" },
