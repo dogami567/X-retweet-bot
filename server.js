@@ -482,6 +482,8 @@ function defaultBulkConfig() {
     version: 1,
     imageDir: "data/bulk-images",
     scanIntervalSec: 3600,
+    defaultProxy: "",
+    proxyPool: [],
     captions: [],
     accounts: [],
   };
@@ -644,7 +646,7 @@ async function bulkPostViaPuppeteer(account, text, filePaths) {
 
   console.log(`[Puppeteer] Starting browser for account ${account.name || account.id}...`);
 
-  const proxyUrl = safeString(account?.proxy).trim() || getXProxyUrlFromEnv();
+  const proxyUrl = getBulkProxyUrl(account);
   const launchArgs = [
     "--disable-blink-features=AutomationControlled",
     "--no-first-run",
@@ -757,6 +759,15 @@ function normalizeBulkConfig(raw) {
 
   const scan = Number(next.scanIntervalSec ?? 3600);
   next.scanIntervalSec = Number.isFinite(scan) ? Math.max(300, Math.round(scan)) : 3600;
+
+  next.defaultProxy = safeString(next.defaultProxy).trim();
+
+  if (typeof next.proxyPool === "string") next.proxyPool = next.proxyPool.split(/\r?\n/g);
+  if (!Array.isArray(next.proxyPool)) next.proxyPool = [];
+  next.proxyPool = next.proxyPool
+    .map((s) => safeString(s).trim())
+    .filter(Boolean)
+    .filter((v, idx, arr) => arr.indexOf(v) === idx);
 
   if (typeof next.captions === "string") next.captions = next.captions.split(/\r?\n/g);
   if (!Array.isArray(next.captions)) next.captions = [];
@@ -1781,12 +1792,22 @@ function getBulkXCredentials(account) {
   };
 }
 
+function getBulkProxyUrl(account) {
+  const accProxy = safeString(account?.proxy).trim();
+  if (accProxy) return accProxy;
+
+  const defaultProxy = safeString(bulkConfig?.defaultProxy).trim();
+  if (defaultProxy) return defaultProxy;
+
+  return getXProxyUrlFromEnv();
+}
+
 function createXClientForBulkAccount(account) {
   const creds = getBulkXCredentials(account);
   const err = validateXCredentials(creds);
   if (err) throw new Error(err);
 
-  const proxyUrl = safeString(account?.proxy).trim() || getXProxyUrlFromEnv();
+  const proxyUrl = getBulkProxyUrl(account);
   const settings = {};
   if (proxyUrl) {
     try {
@@ -1856,12 +1877,13 @@ async function bulkPostOnce(account, options = {}) {
 
   // 1. 尝试初始化 API 客户端
   let xClient = null;
-  let proxyUrl = safeString(a.proxy).trim() || getXProxyUrlFromEnv();
+  let proxyUrl = getBulkProxyUrl(a);
   let useCookieMode = false;
 
   try {
     const created = createXClientForBulkAccount(a);
     xClient = created.client;
+    proxyUrl = created.proxyUrl;
     // 如果有 API Key 配置，优先用 API，否则下面会 fallback
   } catch (e) {
     // 仅当配置了浏览器登录(Profile)/Cookie 且 API 初始化失败（通常是没填 Key）时，才尝试浏览器模式
@@ -3086,7 +3108,7 @@ async function main() {
     if (!profileDir) throw new Error("Profile 目录解析失败");
     await fs.mkdir(profileDir, { recursive: true });
 
-    const proxyUrl = safeString(a?.proxy).trim() || getXProxyUrlFromEnv();
+    const proxyUrl = getBulkProxyUrl(a);
 
     console.log(`[Login] Launching browser: ${exe} profile=${profileDir}`);
 

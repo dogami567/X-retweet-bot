@@ -65,6 +65,16 @@
                          <label class="form-label small text-muted">图库扫描间隔 (秒)</label>
                          <input class="form-control" type="number" id="scanIntervalSec" value="3600">
                     </div>
+                    <div class="col-12">
+                        <label class="form-label small text-muted">默认代理 (可选)</label>
+                        <input class="form-control mono font-monospace small" id="defaultProxy" placeholder="留空=走 .env 的 HTTPS_PROXY/HTTP_PROXY/ALL_PROXY">
+                        <div class="form-text small">账号未填写代理时，会使用这里的默认代理；仍为空则回退到 .env 环境变量。</div>
+                    </div>
+                    <div class="col-12">
+                        <label class="form-label small text-muted">代理池 (每行一个，可选)</label>
+                        <textarea class="form-control mono font-monospace small" id="proxyPool" rows="3" placeholder="http://ip1:port&#10;http://ip2:port"></textarea>
+                        <div class="form-text small">用于账号“代理(Proxy)”快速选择；实际生效仍以账号字段为准。</div>
+                    </div>
                 </div>
             </div>
           </div>
@@ -124,8 +134,14 @@
                                 </div>
 
                                 <div class="col-12">
-                                    <label class="form-label small fw-medium">代理 (Proxy)</label>
+                                    <div class="d-flex justify-content-between align-items-end">
+                                        <label class="form-label small fw-medium mb-0">代理 (Proxy)</label>
+                                        <select class="form-select form-select-sm w-auto" id="accProxyPick" title="从代理池选择（可选）">
+                                            <option value="">从代理池选择…</option>
+                                        </select>
+                                    </div>
                                     <input class="form-control mono font-monospace small" id="accProxy" placeholder="http://127.0.0.1:7890">
+                                    <div class="form-text small">留空=使用“默认代理”，仍为空则回退到 .env 的 HTTPS_PROXY/HTTP_PROXY/ALL_PROXY。</div>
                                 </div>
 
                                 <div class="col-12"><hr class="text-muted opacity-25"></div>
