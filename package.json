@@ -19,6 +19,9 @@
     "dotenv": "^17.2.0",
     "express": "^4.21.2",
     "https-proxy-agent": "^7.0.6",
+    "puppeteer-core": "^24.35.0",
+    "puppeteer-extra": "^3.3.6",
+    "puppeteer-extra-plugin-stealth": "^2.11.2",
     "twitter-api-v2": "^1.28.0"
   },
   "devDependencies": {

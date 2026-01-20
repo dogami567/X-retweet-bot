@@ -1,9 +1,28 @@
 const fs = require("node:fs/promises");
 const fssync = require("node:fs");
 const path = require("node:path");
-const { spawn } = require("node:child_process");
+const { spawn, execSync } = require("node:child_process");
+
+// Puppeteer Stealth Mode
+const puppeteer = require("puppeteer-extra");
+const StealthPlugin = require("puppeteer-extra-plugin-stealth");
+puppeteer.use(StealthPlugin());
 
 const APP_DIR = process.pkg ? path.dirname(process.execPath) : __dirname;
+
+function findLocalBrowser() {
+  const candidates = [
+    "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
+    "C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe",
+    "C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe",
+    "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe",
+    process.env.CHROME_PATH,
+  ];
+  for (const c of candidates) {
+    if (c && fssync.existsSync(c)) return c;
+  }
+  return null;
+}
 
 try {
   // 从项目根目录加载 .env（如果不存在则忽略）
@@ -23,6 +42,8 @@ const DATA_DIR = path.join(APP_DIR, "data");
 const CONFIG_PATH = path.join(DATA_DIR, "config.json");
 const CONFIG_EXAMPLE_PATH = path.join(DATA_DIR, "config.example.json");
 const DB_PATH = path.join(DATA_DIR, "monitor_db.json");
+const BULK_CONFIG_PATH = path.join(DATA_DIR, "bulk_config.json");
+const BULK_IMAGES_DEFAULT_DIR = path.join(DATA_DIR, "bulk-images");
 const DOWNLOAD_DIR = path.join(DATA_DIR, "downloads");
 const PUBLIC_DIR = (() => {
   const external = path.join(APP_DIR, "public");
@@ -31,7 +52,9 @@ const PUBLIC_DIR = (() => {
 })();
 
 const LOG_LIMIT = 200;
+const BULK_LOG_LIMIT = 200;
 const QUEUE_MAX_ATTEMPTS = 5;
+const X_REQUEST_TIMEOUT_MS = 60_000;
 
 function nowIso() {
   return new Date().toISOString();
@@ -48,6 +71,23 @@ function nowTime() {
 function safeString(value) {
   if (value === null || value === undefined) return "";
   return String(value);
+}
+
+function sanitizeDirName(name) {
+  const s = safeString(name).trim();
+  if (!s) return "";
+  return s.replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, 120);
+}
+
+function defaultBulkBrowserProfileDirValue(accountId) {
+  const id = sanitizeDirName(accountId) || "acc";
+  return path.join("data", "browser-profiles", id);
+}
+
+function resolveAppDirPath(value) {
+  const raw = safeString(value).trim();
+  if (!raw) return "";
+  return path.isAbsolute(raw) ? raw : path.resolve(APP_DIR, raw);
 }
 
 function parseBoolEnv(value) {
@@ -431,6 +471,315 @@ async function writeJson(filePath, data) {
   await fs.writeFile(filePath, json, "utf8");
 }
 
+function generateId(prefix) {
+  const p = safeString(prefix || "id").trim() || "id";
+  const rand = Math.random().toString(16).slice(2, 10);
+  return `${p}_${Date.now()}_${rand}`;
+}
+
+function defaultBulkConfig() {
+  return {
+    version: 1,
+    imageDir: "data/bulk-images",
+    scanIntervalSec: 3600,
+    captions: [],
+    accounts: [],
+  };
+}
+
+function normalizeBulkAccount(raw) {
+  const a = raw && typeof raw === "object" ? JSON.parse(JSON.stringify(raw)) : {};
+
+  a.id = safeString(a.id).trim();
+  a.name = safeString(a.name).trim();
+  a.enabled = a.enabled === undefined ? true : Boolean(a.enabled);
+  a.dryRun = a.dryRun === undefined ? true : Boolean(a.dryRun);
+  a.proxy = safeString(a.proxy).trim();
+
+  a.schedule = a.schedule && typeof a.schedule === "object" ? a.schedule : {};
+  const intervalMinRaw = Number(a.schedule.intervalMin ?? 120);
+  const jitterMinFallback =
+    a.schedule.jitterMin === undefined && a.schedule.jitterSec !== undefined ? Number(a.schedule.jitterSec) / 60 : undefined;
+  const jitterMinRaw = Number(a.schedule.jitterMin ?? jitterMinFallback ?? 10);
+  const imagesMinRaw = Number(a.schedule.imagesMin ?? 1);
+  const imagesMaxRaw = Number(a.schedule.imagesMax ?? 4);
+
+  a.schedule.intervalMin = Number.isFinite(intervalMinRaw) ? Math.max(1, Math.round(intervalMinRaw)) : 120;
+  a.schedule.jitterMin = Number.isFinite(jitterMinRaw) ? Math.max(0, Math.round(jitterMinRaw)) : 10;
+  delete a.schedule.jitterSec;
+
+  const imagesMin = Number.isFinite(imagesMinRaw) ? Math.max(0, Math.round(imagesMinRaw)) : 1;
+  const imagesMax = Number.isFinite(imagesMaxRaw) ? Math.max(0, Math.round(imagesMaxRaw)) : 4;
+  a.schedule.imagesMin = Math.min(4, Math.max(0, Math.min(imagesMin, imagesMax)));
+  a.schedule.imagesMax = Math.min(4, Math.max(a.schedule.imagesMin, imagesMax));
+
+  a.x = a.x && typeof a.x === "object" ? a.x : {};
+  a.x.apiKey = safeString(a.x.apiKey).trim();
+  a.x.apiSecret = safeString(a.x.apiSecret).trim();
+  a.x.accessToken = safeString(a.x.accessToken).trim();
+  a.x.accessSecret = safeString(a.x.accessSecret).trim();
+  a.x.profileDir = safeString(a.x.profileDir).trim();
+  a.x.cookieString = safeString(a.x.cookieString).trim();
+  a.x.queryId = safeString(a.x.queryId).trim();
+
+  return a;
+}
+
+function extractCookie(cookieStr, key) {
+  if (!cookieStr) return "";
+  const match = cookieStr.match(new RegExp(`(?:^|; )\\s*${key}=([^;]*)`));
+  return match ? decodeURIComponent(match[1]) : "";
+}
+
+async function bulkUploadMediaViaCookie(cookieStr, mediaItems, proxyUrl) {
+  const items = Array.isArray(mediaItems) ? mediaItems : [];
+  if (items.length === 0) return [];
+
+  const ct0 = extractCookie(cookieStr, "ct0");
+  const authToken = extractCookie(cookieStr, "auth_token");
+  if (!ct0 || !authToken) throw new Error("Cookie 模式缺少 ct0 或 auth_token");
+
+  const agent = getCachedHttpsProxyAgent(proxyUrl);
+  const client = axios.create({
+    baseURL: "https://upload.twitter.com",
+    timeout: 60_000,
+    headers: {
+      "x-csrf-token": ct0,
+      authorization: "Bearer AAAAAAAAAAAAAAAAAAAAANRILgAAAAAAnNwIzUejRCOuH5E6I8xnZz4puTs%3D1Zv7ttfk8LF81IUq16cHjhLTvJu4FA33AGWWjCpTnA",
+      cookie: cookieStr,
+      "x-twitter-active-user": "yes",
+      "x-twitter-client-language": "en",
+      "x-twitter-auth-type": "OAuth2Session",
+      "origin": "https://twitter.com",
+      "referer": "https://twitter.com/",
+    },
+    ...(agent ? { httpAgent: agent, httpsAgent: agent } : {}),
+  });
+
+  const mediaIds = [];
+  for (const item of items) {
+    if (!item.buffer) continue;
+    const size = item.buffer.length;
+    const mimeType = item.mimeType || "application/octet-stream";
+
+    // 1. INIT
+    const initParams = new URLSearchParams();
+    initParams.append("command", "INIT");
+    initParams.append("total_bytes", size);
+    initParams.append("media_type", mimeType);
+    initParams.append("media_category", "tweet_image");
+
+    const initRes = await client.post("/i/media/upload.json", initParams.toString());
+    const mediaId = safeString(initRes.data?.media_id_string);
+    if (!mediaId) throw new Error("Cookie 上传失败：INIT 未返回 media_id");
+
+    // 2. APPEND
+    const appendParams = new URLSearchParams();
+    appendParams.append("command", "APPEND");
+    appendParams.append("media_id", mediaId);
+    appendParams.append("segment_index", "0");
+    appendParams.append("media_data", item.buffer.toString("base64"));
+    await client.post("/i/media/upload.json", appendParams.toString(), {
+        maxBodyLength: Infinity,
+        maxContentLength: Infinity
+    });
+
+    // 3. FINALIZE
+    const finParams = new URLSearchParams();
+    finParams.append("command", "FINALIZE");
+    finParams.append("media_id", mediaId);
+    await client.post("/i/media/upload.json", finParams.toString());
+
+    mediaIds.push(mediaId);
+  }
+  return mediaIds;
+}
+
+async function bulkPostViaCookie(account, text, mediaIds, proxyUrl) {
+  // 之前的 API 方案被风控 (Error 226)，现改为使用 Puppeteer 模拟真实浏览器发帖
+  // 注意：mediaIds 在这里不再适用，因为 Puppeteer 需要直接上传文件路径
+  // 但上层调用者已经传了 mediaIds，这意味着上层已经把图片读出来了。
+  // 我们需要重构一下，让上层传文件路径给这个函数，或者我们这里把 buffer 写临时文件。
+  
+  // 由于重构上层比较麻烦，我们这里直接抛出特殊错误，或者修改上层逻辑。
+  // 更好的方式是：修改 bulkPostOnce，让它在 Cookie 模式下不上传 API，而是收集文件路径传给这里。
+  throw new Error("Internal: bulkPostViaCookie 需升级配合 Puppeteer"); 
+}
+
+// 辅助函数：等待并点击
+async function puppeteerClick(page, selector) {
+    await page.waitForSelector(selector, { visible: true, timeout: 15000 });
+    await page.click(selector);
+}
+
+async function bulkPostViaPuppeteer(account, text, filePaths) {
+  const exe = findLocalBrowser();
+  if (!exe) throw new Error("浏览器发帖需要本地 Chrome/Edge。");
+
+  const profileDirValue = safeString(account?.x?.profileDir).trim();
+  const profileDir = profileDirValue ? resolveAppDirPath(profileDirValue) : "";
+  const hasProfile = Boolean(profileDir);
+
+  const cookieStr = safeString(account?.x?.cookieString);
+  const cookiePairs = hasProfile
+    ? []
+    : cookieStr
+        .split(";")
+        .map((s) => {
+          const [name, ...v] = s.trim().split("=");
+          return { name, value: v.join("=") };
+        })
+        .filter((c) => c.name && c.value);
+
+  // 同时写入 x.com 与 twitter.com，避免域名跳转导致 Cookie 不生效
+  const cookies = [];
+  for (const c of cookiePairs) {
+    cookies.push({ ...c, url: "https://x.com", secure: true, sameSite: "None" });
+    cookies.push({ ...c, url: "https://twitter.com", secure: true, sameSite: "None" });
+  }
+
+  if (!hasProfile && cookies.length === 0) {
+    throw new Error("未配置浏览器登录（Profile）或 Cookie");
+  }
+
+  console.log(`[Puppeteer] Starting browser for account ${account.name || account.id}...`);
+
+  const proxyUrl = safeString(account?.proxy).trim() || getXProxyUrlFromEnv();
+  const launchArgs = [
+    "--disable-blink-features=AutomationControlled",
+    "--no-first-run",
+    "--disable-infobars",
+    "--window-size=1280,900", // 稍微大一点，确保 SideNav 显示
+  ];
+  if (proxyUrl) launchArgs.push(`--proxy-server=${proxyUrl}`);
+
+  const browser = await puppeteer.launch({
+    executablePath: exe,
+    headless: false,
+    defaultViewport: null,
+    ...(hasProfile ? { userDataDir: profileDir } : {}),
+    ignoreDefaultArgs: ["--enable-automation"],
+    args: launchArgs,
+  });
+
+  try {
+    const page = await browser.newPage();
+    if (!hasProfile) await page.setCookie(...cookies);
+    
+    // 1. Go to Home first (Standard user behavior)
+    await page.goto("https://x.com/home", { waitUntil: "networkidle2", timeout: 60000 });
+
+    if (page.url().includes("login") || page.url().includes("/i/flow/login")) {
+      throw new Error("未登录：请先点“打开浏览器登录”完成登录");
+    }
+
+    // 2. Open Compose Window (Try SideNav button first, like XActions)
+    const sideNavBtnSelector = '[data-testid="SideNav_NewTweet_Button"]';
+    const composeUrl = "https://x.com/compose/tweet";
+    
+    try {
+        await page.waitForSelector(sideNavBtnSelector, { timeout: 5000 });
+        await page.click(sideNavBtnSelector);
+        console.log("[Puppeteer] Clicked SideNav Tweet Button");
+    } catch {
+        console.log("[Puppeteer] SideNav button not found, navigating to compose URL...");
+        await page.goto(composeUrl, { waitUntil: "networkidle2" });
+    }
+
+    // 3. Wait for Editor
+    // XActions selectors: tweetTextarea = '[data-testid="tweetTextarea_0"]'
+    const editorSelector = '[data-testid="tweetTextarea_0"]';
+    await page.waitForSelector(editorSelector, { timeout: 15000 });
+    
+    // Ensure focus
+    await page.click(editorSelector).catch(() => {});
+    await new Promise(r => setTimeout(r, 500));
+
+    // 4. Upload Media
+    if (filePaths && filePaths.length > 0) {
+        // XActions selector: input[data-testid="fileInput"]
+        const inputSelector = 'input[data-testid="fileInput"]'; 
+        // Note: The input might be hidden, waitForSelector might fail if checking visibility.
+        // Just waitForSelector in DOM is enough.
+        const input = await page.$(inputSelector);
+        if (input) {
+            await input.uploadFile(...filePaths);
+            // Wait for upload previews to appear
+            // XActions doesn't have explicit wait logic for this as it's manual, 
+            // but we can wait for [data-testid="attachments"] or just strict timeout.
+            await new Promise(r => setTimeout(r, 3000 + (filePaths.length * 2000))); 
+        } else {
+            console.log("[Puppeteer] Warning: File input not found!");
+        }
+    }
+
+    // 5. Type Text
+    await page.keyboard.type(text, { delay: 50 }); // Natural typing
+
+    // 6. Click Send
+    // XActions selectors: tweetButton or tweetButtonInline
+    const tweetBtnSelector = '[data-testid="tweetButton"]';
+    const tweetBtnInlineSelector = '[data-testid="tweetButtonInline"]';
+    
+    let sendBtn = await page.$(tweetBtnSelector);
+    if (!sendBtn) sendBtn = await page.$(tweetBtnInlineSelector);
+    
+    if (sendBtn) {
+        // Scroll into view (XActions core.js logic)
+        await sendBtn.evaluate(b => b.scrollIntoView({ block: 'center' }));
+        await new Promise(r => setTimeout(r, 500));
+        
+        // Click
+        await sendBtn.click();
+        console.log("[Puppeteer] Clicked Send.");
+    } else {
+        throw new Error("Send button not found");
+    }
+
+    // 7. Wait for completion
+    // Wait for the modal to disappear or URL to change back to home
+    await new Promise(r => setTimeout(r, 5000));
+    
+    return "puppeteer_id_" + Date.now();
+
+  } finally {
+    await browser.close();
+  }
+}
+
+function normalizeBulkConfig(raw) {
+  const next = raw && typeof raw === "object" ? JSON.parse(JSON.stringify(raw)) : defaultBulkConfig();
+  if (!next || typeof next !== "object") return defaultBulkConfig();
+
+  next.version = 1;
+  next.imageDir = safeString(next.imageDir).trim();
+  if (!next.imageDir) next.imageDir = "data/bulk-images";
+
+  const scan = Number(next.scanIntervalSec ?? 3600);
+  next.scanIntervalSec = Number.isFinite(scan) ? Math.max(300, Math.round(scan)) : 3600;
+
+  if (typeof next.captions === "string") next.captions = next.captions.split(/\r?\n/g);
+  if (!Array.isArray(next.captions)) next.captions = [];
+  next.captions = next.captions.map((s) => safeString(s).trim()).filter(Boolean);
+
+  if (!Array.isArray(next.accounts)) next.accounts = [];
+  next.accounts = next.accounts.map((a) => normalizeBulkAccount(a)).filter(Boolean);
+
+  return next;
+}
+
+function resolveBulkImageDir(cfg) {
+  const raw = safeString(cfg?.imageDir).trim();
+  const value = raw || "data/bulk-images";
+  if (value === "data/bulk-images") return BULK_IMAGES_DEFAULT_DIR;
+  return path.isAbsolute(value) ? value : path.resolve(APP_DIR, value);
+}
+
+function isImageFileName(fileName) {
+  const ext = safeString(path.extname(fileName)).trim().toLowerCase();
+  return [".jpg", ".jpeg", ".png", ".gif", ".webp"].includes(ext);
+}
+
 async function ensureDataFiles() {
   await fs.mkdir(DATA_DIR, { recursive: true });
   await fs.mkdir(DOWNLOAD_DIR, { recursive: true });
@@ -458,9 +807,14 @@ async function ensureDataFiles() {
   if (!(await fileExists(DB_PATH))) {
     await writeJson(DB_PATH, { version: 1, targets: {}, queue: [] });
   }
+
+  if (!(await fileExists(BULK_CONFIG_PATH))) {
+    await writeJson(BULK_CONFIG_PATH, defaultBulkConfig());
+  }
 }
 
 const logs = [];
+const bulkLogs = [];
 const stats = {
   apiCalls: 0,
   xCalls: 0,
@@ -474,6 +828,15 @@ function addLog(message, extra) {
   };
   logs.push(entry);
   while (logs.length > LOG_LIMIT) logs.shift();
+}
+
+function addBulkLog(message, extra) {
+  const entry = {
+    time: nowTime(),
+    message: extra ? `${message} ${safeString(extra)}` : message,
+  };
+  bulkLogs.push(entry);
+  while (bulkLogs.length > BULK_LOG_LIMIT) bulkLogs.shift();
 }
 
 function createTwitterClient(config) {
@@ -610,12 +973,12 @@ function createXClient(config) {
 
 async function getXLoggedUserId(xClient) {
   try {
-    const me = await xClient.v2.me();
+    const me = await xClient.v2.get("users/me", {}, { timeout: X_REQUEST_TIMEOUT_MS });
     const id = safeString(me?.data?.id).trim();
     if (id) return id;
   } catch {}
 
-  const user = await xClient.v1.verifyCredentials();
+  const user = await xClient.v1.get("account/verify_credentials.json", {}, { timeout: X_REQUEST_TIMEOUT_MS });
   return safeString(pickFirstString(user?.id_str, user?.id)).trim();
 }
 
@@ -635,6 +998,42 @@ function formatXError(err) {
   }
   const msg = safeString(err.message || err);
   return code ? `HTTP ${code}：${msg}` : msg;
+}
+
+function formatXRequestCause(err) {
+  const e = err && typeof err === "object" ? err : null;
+  if (!e) return "";
+
+  const inner =
+    e?.requestError ||
+    e?._options?.requestError ||
+    e?._options?.error ||
+    e?.cause ||
+    e?.error;
+
+  const innerMsg = safeString(inner?.message || inner).trim();
+  const innerCode = safeString(inner?.code).trim();
+  if (innerCode && innerMsg) return `${innerCode}:${innerMsg}`;
+  if (innerCode) return innerCode;
+  return innerMsg;
+}
+
+function formatXErrorVerbose(err, ctx = {}) {
+  const base = formatXError(err);
+  const e = err && typeof err === "object" ? err : null;
+
+  const parts = [];
+  const type = safeString(e?.type || e?.name).trim();
+  if (type) parts.push(`type=${type}`);
+
+  const cause = formatXRequestCause(e);
+  if (cause && !safeString(base).includes(cause)) parts.push(`cause=${cause}`);
+
+  const proxy = safeString(ctx?.proxy).trim();
+  if (proxy) parts.push(`proxy=${redactUrlCredentials(proxy)}`);
+
+  if (parts.length === 0) return base;
+  return `${base} (${parts.join(", ")})`;
 }
 
 const proxyAgentCache = new Map();
@@ -1120,6 +1519,395 @@ let config = null;
 let configFile = null;
 let db = null;
 
+let bulkConfig = null;
+let bulkConfigFile = null;
+
+let bulkRunning = false;
+const bulkTimers = new Map(); // accountId -> Timeout
+const bulkStates = new Map(); // accountId -> state
+let bulkScanTimer = null;
+let bulkImagesCache = { dir: "", images: [], scannedAt: "" };
+
+function ensureBulkAccountIds(cfgFile) {
+  const next = cfgFile && typeof cfgFile === "object" ? cfgFile : {};
+  if (!Array.isArray(next.accounts)) next.accounts = [];
+
+  let changed = false;
+  for (const a of next.accounts) {
+    if (!a || typeof a !== "object") continue;
+    if (!safeString(a.id).trim()) {
+      // 仅在缺失时生成一次并落盘，避免每次启动都变化
+      a.id = generateId("acc");
+      changed = true;
+    }
+  }
+  return { changed, config: next };
+}
+
+function getBulkAccounts() {
+  return Array.isArray(bulkConfig?.accounts) ? bulkConfig.accounts : [];
+}
+
+function findBulkAccount(accountId) {
+  const id = safeString(accountId).trim();
+  if (!id) return null;
+  return getBulkAccounts().find((a) => safeString(a?.id).trim() === id) || null;
+}
+
+function upsertBulkState(accountId) {
+  const id = safeString(accountId).trim();
+  if (!id) return null;
+  if (!bulkStates.has(id)) {
+    bulkStates.set(id, { running: false, nextPostAt: "", lastPostAt: "", posts: 0, lastError: "", lastTweetId: "" });
+  }
+  return bulkStates.get(id);
+}
+
+function randomIntInclusive(min, max) {
+  const a = Math.round(Number(min));
+  const b = Math.round(Number(max));
+  if (!Number.isFinite(a) || !Number.isFinite(b)) return 0;
+  const lo = Math.min(a, b);
+  const hi = Math.max(a, b);
+  return lo + Math.floor(Math.random() * (hi - lo + 1));
+}
+
+function pickRandomItem(items) {
+  const arr = Array.isArray(items) ? items : [];
+  if (arr.length === 0) return null;
+  return arr[Math.floor(Math.random() * arr.length)];
+}
+
+function sampleWithoutReplacement(items, count) {
+  const arr = Array.isArray(items) ? items.slice() : [];
+  const n = Math.max(0, Math.min(arr.length, Math.round(Number(count) || 0)));
+  for (let i = arr.length - 1; i > 0; i -= 1) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [arr[i], arr[j]] = [arr[j], arr[i]];
+  }
+  return arr.slice(0, n);
+}
+
+function computeBulkDelayMs(schedule) {
+  const s = schedule && typeof schedule === "object" ? schedule : {};
+  const intervalMinRaw = Number(s.intervalMin ?? 120);
+  const jitterMinFallback = s.jitterMin === undefined && s.jitterSec !== undefined ? Number(s.jitterSec) / 60 : undefined;
+  const jitterMinRaw = Number(s.jitterMin ?? jitterMinFallback ?? 10);
+
+  const baseSec = Number.isFinite(intervalMinRaw) ? Math.max(60, Math.round(intervalMinRaw * 60)) : 7200;
+  const jitterMin = Number.isFinite(jitterMinRaw) ? Math.max(0, Math.round(jitterMinRaw)) : 0;
+
+  const deltaSec = jitterMin > 0 ? randomIntInclusive(-jitterMin, jitterMin) * 60 : 0;
+  const sec = Math.max(60, baseSec + deltaSec);
+  return sec * 1000;
+}
+
+async function scanBulkImages(trigger) {
+  const dir = resolveBulkImageDir(bulkConfig);
+  if (!dir) {
+    bulkImagesCache = { dir: "", images: [], scannedAt: nowIso() };
+    return bulkImagesCache;
+  }
+
+  try {
+    await fs.mkdir(dir, { recursive: true });
+  } catch (e) {
+    addBulkLog(`[图库] 创建目录失败：${safeString(e?.message || e)}`);
+    bulkImagesCache = { dir, images: [], scannedAt: nowIso() };
+    return bulkImagesCache;
+  }
+
+  let entries;
+  try {
+    entries = await fs.readdir(dir, { withFileTypes: true });
+  } catch (e) {
+    addBulkLog(`[图库] 读取目录失败：${safeString(e?.message || e)} dir=${dir}`);
+    bulkImagesCache = { dir, images: [], scannedAt: nowIso() };
+    return bulkImagesCache;
+  }
+
+  const images = [];
+  for (const ent of entries) {
+    if (!ent?.isFile?.()) continue;
+    const name = safeString(ent.name).trim();
+    if (!name || !isImageFileName(name)) continue;
+
+    const fullPath = path.join(dir, name);
+    try {
+      // eslint-disable-next-line no-await-in-loop
+      const stat = await fs.stat(fullPath);
+      images.push({ name, size: Number(stat.size) || 0, mtimeMs: Number(stat.mtimeMs) || 0 });
+    } catch {}
+  }
+
+  images.sort((a, b) => (Number(b.mtimeMs) || 0) - (Number(a.mtimeMs) || 0));
+
+  const prevNames = new Set((bulkImagesCache?.images || []).map((i) => safeString(i?.name).trim()).filter(Boolean));
+  const added = images.filter((i) => !prevNames.has(safeString(i?.name).trim())).length;
+
+  bulkImagesCache = { dir, images, scannedAt: nowIso() };
+  if (added > 0) addBulkLog(`[图库] 检测到新增图片：added=${added} trigger=${safeString(trigger || "manual")}`);
+  return bulkImagesCache;
+}
+
+function startBulkScanTimer() {
+  if (bulkScanTimer) return;
+  const intervalSec = Number(bulkConfig?.scanIntervalSec ?? 3600);
+  const sec = Number.isFinite(intervalSec) ? Math.max(300, Math.round(intervalSec)) : 3600;
+  bulkScanTimer = setInterval(() => {
+    scanBulkImages("timer").catch(() => {});
+  }, sec * 1000);
+}
+
+function stopBulkScanTimer() {
+  if (bulkScanTimer) clearInterval(bulkScanTimer);
+  bulkScanTimer = null;
+}
+
+function getBulkXCredentials(account) {
+  const x = account?.x && typeof account.x === "object" ? account.x : {};
+  return {
+    appKey: safeString(x.apiKey).trim(),
+    appSecret: safeString(x.apiSecret).trim(),
+    accessToken: safeString(x.accessToken).trim(),
+    accessSecret: safeString(x.accessSecret).trim(),
+  };
+}
+
+function createXClientForBulkAccount(account) {
+  const creds = getBulkXCredentials(account);
+  const err = validateXCredentials(creds);
+  if (err) throw new Error(err);
+
+  const proxyUrl = safeString(account?.proxy).trim() || getXProxyUrlFromEnv();
+  const settings = {};
+  if (proxyUrl) {
+    try {
+      settings.httpAgent = new HttpsProxyAgent(proxyUrl);
+    } catch (e) {
+      throw new Error(`HTTPS_PROXY 无效：${safeString(e?.message || e)}`);
+    }
+  }
+
+  return {
+    client: new TwitterApi(
+      {
+        appKey: creds.appKey,
+        appSecret: creds.appSecret,
+        accessToken: creds.accessToken,
+        accessSecret: creds.accessSecret,
+      },
+      settings,
+    ),
+    proxyUrl,
+  };
+}
+
+function pickBulkCaption() {
+  const captions = Array.isArray(bulkConfig?.captions) ? bulkConfig.captions : [];
+  return safeString(pickRandomItem(captions) || "").trim();
+}
+
+async function bulkPostOnce(account, options = {}) {
+  const a = account && typeof account === "object" ? account : null;
+  if (!a) throw new Error("账号不存在");
+
+  const state = upsertBulkState(a.id);
+  if (!state) throw new Error("账号状态异常");
+
+  const trigger = safeString(options.trigger || "timer").trim() || "timer";
+
+  const caption = pickBulkCaption();
+  const imageDir = resolveBulkImageDir(bulkConfig);
+  const imagesMin = Number(a?.schedule?.imagesMin ?? 1);
+  const imagesMax = Number(a?.schedule?.imagesMax ?? 4);
+  const wantCount = randomIntInclusive(imagesMin, imagesMax);
+
+  const { images } = await scanBulkImages(trigger);
+  const availableNames = images.map((i) => safeString(i?.name).trim()).filter(Boolean);
+  const maxPhotos = Math.min(4, availableNames.length);
+  const count = Math.max(0, Math.min(maxPhotos, wantCount));
+  const pickedNames = sampleWithoutReplacement(availableNames, count);
+
+  if (!caption && pickedNames.length === 0) {
+    addBulkLog(`[发帖] 跳过：无文案且无图片 account=${safeString(a.name || a.id)}`);
+    return { skipped: true, reason: "empty" };
+  }
+  if (pickedNames.length > 0 && !imageDir) {
+    throw new Error("未配置图片目录（imageDir）");
+  }
+
+  if (a.dryRun) {
+    const preview = caption.length > 60 ? `${caption.slice(0, 60)}…` : caption;
+    addBulkLog(
+      `[DRY-RUN] 将发帖 account=${safeString(a.name || a.id)} images=${pickedNames.length} caption="${preview}"`,
+      pickedNames.length ? `files=${pickedNames.join(",")}` : "",
+    );
+    return { dryRun: true, caption, images: pickedNames };
+  }
+
+  // 1. 尝试初始化 API 客户端
+  let xClient = null;
+  let proxyUrl = safeString(a.proxy).trim() || getXProxyUrlFromEnv();
+  let useCookieMode = false;
+
+  try {
+    const created = createXClientForBulkAccount(a);
+    xClient = created.client;
+    // 如果有 API Key 配置，优先用 API，否则下面会 fallback
+  } catch (e) {
+    // 仅当配置了浏览器登录(Profile)/Cookie 且 API 初始化失败（通常是没填 Key）时，才尝试浏览器模式
+    const hasBrowserSession = Boolean(safeString(a.x?.profileDir).trim() || safeString(a.x?.cookieString).trim());
+    if (hasBrowserSession) {
+      useCookieMode = true;
+    } else {
+      throw new Error(safeString(e?.message || e));
+    }
+  }
+
+  // 2. 准备媒体文件 (路径或buffer)
+  const mediaItems = [];
+  const mediaFilePaths = []; // For Puppeteer
+  
+  for (const name of pickedNames) {
+    const filePath = path.join(imageDir, name);
+    mediaFilePaths.push(filePath);
+    
+    // API模式才需要 Buffer
+    if (!useCookieMode) {
+        // eslint-disable-next-line no-await-in-loop
+        const buffer = await fs.readFile(filePath);
+        const mimeType = mimeTypeFromFileName(name) || "application/octet-stream";
+        mediaItems.push({ buffer, mimeType, fileName: name });
+    }
+  }
+
+  // 3. 上传媒体
+  let mediaIds = [];
+  if (!useCookieMode && mediaItems.length > 0) {
+    try {
+       mediaIds = await uploadMediaToX(xClient, mediaItems);
+    } catch (e) {
+      throw new Error(`上传媒体失败[API]: ${formatXErrorVerbose(e, { proxy: proxyUrl })}`);
+    }
+  }
+
+  // 4. 发帖
+  let tweetId = "";
+  if (useCookieMode) {
+     try {
+       stats.xCalls += 1;
+       // Switch to Puppeteer for Cookie mode to avoid fingerprinting issues (Error 226)
+       tweetId = await bulkPostViaPuppeteer(a, truncateTweetText(caption || "", 280), mediaFilePaths);
+     } catch(e) {
+       throw new Error(`发帖失败[Puppeteer]: ${safeString(e.message || e)}`);
+     }
+  } else {
+    const payload = { text: truncateTweetText(caption || "", 280) };
+    if (mediaIds.length) payload.media = { media_ids: mediaIds };
+    if (!payload.text && mediaIds.length === 0) throw new Error("无可发布内容（text/media 均为空）");
+
+    let res;
+    try {
+      stats.xCalls += 1;
+      res = await xClient.v2.post("tweets", payload, { timeout: X_REQUEST_TIMEOUT_MS });
+    } catch (e) {
+      throw new Error(`发帖失败[API]: ${formatXErrorVerbose(e, { proxy: proxyUrl })}`);
+    }
+    tweetId = safeString(res?.data?.id).trim();
+  }
+  
+  if (!tweetId) throw new Error("发帖失败：未返回 tweet id");
+
+  const mode = useCookieMode ? (safeString(a.x?.profileDir).trim() ? "Browser" : "Cookie") : "API";
+  addBulkLog(
+    `[发帖成功] account=${safeString(a.name || a.id)} tweet_id=${tweetId} images=${mediaIds.length} mode=${mode} proxy=${redactUrlCredentials(proxyUrl)}`,
+  );
+  state.lastTweetId = tweetId;
+  return { ok: true, tweetId, mediaIds, caption, images: pickedNames };
+}
+
+async function bulkTick(accountId, trigger) {
+  if (!bulkRunning) return;
+  const a = findBulkAccount(accountId);
+  if (!a || !a.enabled) return;
+
+  const state = upsertBulkState(a.id);
+  if (!state) return;
+  if (state.running) {
+    addBulkLog(`[发帖] 上一次未结束，跳过：account=${safeString(a.name || a.id)}`);
+    return;
+  }
+
+  state.running = true;
+  state.lastError = "";
+  try {
+    const result = await bulkPostOnce(a, { trigger });
+    if (!result?.skipped) state.posts = Number(state.posts || 0) + 1;
+    state.lastPostAt = nowIso();
+  } catch (e) {
+    state.lastError = safeString(e?.message || e);
+    addBulkLog(`[发帖失败] account=${safeString(a.name || a.id)} error=${state.lastError}`);
+  } finally {
+    state.running = false;
+  }
+
+  const delayMs = computeBulkDelayMs(a.schedule);
+  const nextAt = new Date(Date.now() + delayMs).toISOString();
+  state.nextPostAt = nextAt;
+  scheduleBulkNext(a.id, delayMs);
+}
+
+function scheduleBulkNext(accountId, delayMs) {
+  const id = safeString(accountId).trim();
+  if (!id) return;
+  if (!bulkRunning) return;
+
+  const prev = bulkTimers.get(id);
+  if (prev) clearTimeout(prev);
+
+  const t = setTimeout(() => {
+    bulkTick(id, "timer").catch(() => {});
+  }, Math.max(1000, Math.round(Number(delayMs) || 0)));
+
+  bulkTimers.set(id, t);
+}
+
+function startBulkScheduler() {
+  if (bulkRunning) return;
+  bulkRunning = true;
+  startBulkScanTimer();
+  scanBulkImages("start").catch(() => {});
+
+  for (const a of getBulkAccounts()) {
+    if (!a?.enabled) continue;
+    const state = upsertBulkState(a.id);
+    if (!state) continue;
+
+    const delayMs = computeBulkDelayMs(a.schedule);
+    state.nextPostAt = new Date(Date.now() + delayMs).toISOString();
+    scheduleBulkNext(a.id, delayMs);
+  }
+
+  addBulkLog(`[系统] 批量发帖已启动 accounts=${getBulkAccounts().filter((a) => a.enabled).length}`);
+}
+
+function stopBulkScheduler() {
+  if (!bulkRunning) return;
+  bulkRunning = false;
+  stopBulkScanTimer();
+
+  for (const t of bulkTimers.values()) clearTimeout(t);
+  bulkTimers.clear();
+
+  for (const state of bulkStates.values()) {
+    state.running = false;
+    state.nextPostAt = "";
+  }
+
+  addBulkLog("[系统] 批量发帖已停止");
+}
+
 let monitorTimer = null;
 let monitorRunning = false;
 let monitorTickInProgress = false;
@@ -1303,7 +2091,7 @@ async function processQueue() {
         if (!payload.text && mediaIds.length === 0) throw new Error("无可发布内容（text/media 均为空）");
 
         stats.xCalls += 1;
-        const res = await xClient.v2.tweet(payload);
+        const res = await xClient.v2.post("tweets", payload, { timeout: X_REQUEST_TIMEOUT_MS });
         if (res?.data?.id) {
           const mediaHint = mediaIds.length ? ` media=${mediaIds.length}` : "";
           const savedHint = prepared.downloadDir ? ` saved=${prepared.downloadDir}` : "";
@@ -1570,9 +2358,25 @@ async function main() {
   config = applyEnvOverrides(configFile);
   db = await readJson(DB_PATH, { version: 1, targets: {}, queue: [] });
 
+  bulkConfigFile = await readJson(BULK_CONFIG_PATH, defaultBulkConfig());
+  const ensured = ensureBulkAccountIds(bulkConfigFile);
+  if (ensured.changed) {
+    bulkConfigFile = ensured.config;
+    await writeJson(BULK_CONFIG_PATH, bulkConfigFile);
+  }
+  bulkConfig = normalizeBulkConfig(bulkConfigFile);
+
   const app = express();
   app.use(cors());
   app.use(express.json({ limit: "1mb" }));
+  // API 默认不缓存，避免浏览器/代理缓存导致“刷新后配置看起来丢了”
+  app.use((req, res, next) => {
+    if (typeof req.path === "string" && req.path.startsWith("/api/")) {
+      res.setHeader("Cache-Control", "no-store");
+      res.setHeader("Pragma", "no-cache");
+    }
+    next();
+  });
   app.use(express.static(PUBLIC_DIR));
 
   app.get("/api/config", async (_req, res) => {
@@ -1580,14 +2384,15 @@ async function main() {
   });
 
   app.post("/api/config", async (req, res) => {
-    const incoming = req.body || {};
-    const next = JSON.parse(JSON.stringify(configFile || {}));
-    next.twitterApi = next.twitterApi || {};
-    next.monitor = next.monitor || {};
-    next.forward = next.forward || {};
+    try {
+      const incoming = req.body || {};
+      const next = JSON.parse(JSON.stringify(configFile || {}));
+      next.twitterApi = next.twitterApi || {};
+      next.monitor = next.monitor || {};
+      next.forward = next.forward || {};
 
-    if (incoming?.twitterApi?.apiKey !== undefined) next.twitterApi.apiKey = safeString(incoming.twitterApi.apiKey).trim();
-    if (incoming?.twitterApi?.baseUrl) next.twitterApi.baseUrl = safeString(incoming.twitterApi.baseUrl).trim();
+      if (incoming?.twitterApi?.apiKey !== undefined) next.twitterApi.apiKey = safeString(incoming.twitterApi.apiKey).trim();
+      if (incoming?.twitterApi?.baseUrl) next.twitterApi.baseUrl = safeString(incoming.twitterApi.baseUrl).trim();
 
 	    if (Array.isArray(incoming?.monitor?.targets)) next.monitor.targets = incoming.monitor.targets.map(normalizeScreenName).filter(Boolean);
 	    if (incoming?.monitor?.pollIntervalSec !== undefined) next.monitor.pollIntervalSec = Math.max(10, Number(incoming.monitor.pollIntervalSec || 60));
@@ -1602,56 +2407,67 @@ async function main() {
 	    if (incoming?.forward?.translateToZh !== undefined) next.forward.translateToZh = Boolean(incoming.forward.translateToZh);
 	    if (incoming?.forward?.proxy !== undefined) next.forward.proxy = safeString(incoming.forward.proxy).trim();
 
-    if (incoming?.forward?.x && typeof incoming.forward.x === "object") {
-      next.forward.x = next.forward.x || {};
-      if (incoming.forward.x.apiKey !== undefined) next.forward.x.apiKey = safeString(incoming.forward.x.apiKey).trim();
-      if (incoming.forward.x.apiSecret !== undefined) next.forward.x.apiSecret = safeString(incoming.forward.x.apiSecret).trim();
-      if (incoming.forward.x.accessToken !== undefined) next.forward.x.accessToken = safeString(incoming.forward.x.accessToken).trim();
-      if (incoming.forward.x.accessSecret !== undefined) next.forward.x.accessSecret = safeString(incoming.forward.x.accessSecret).trim();
+      if (incoming?.forward?.x && typeof incoming.forward.x === "object") {
+        next.forward.x = next.forward.x || {};
+        if (incoming.forward.x.apiKey !== undefined) next.forward.x.apiKey = safeString(incoming.forward.x.apiKey).trim();
+        if (incoming.forward.x.apiSecret !== undefined) next.forward.x.apiSecret = safeString(incoming.forward.x.apiSecret).trim();
+        if (incoming.forward.x.accessToken !== undefined) next.forward.x.accessToken = safeString(incoming.forward.x.accessToken).trim();
+        if (incoming.forward.x.accessSecret !== undefined) next.forward.x.accessSecret = safeString(incoming.forward.x.accessSecret).trim();
+      }
+
+      configFile = next;
+      await writeJson(CONFIG_PATH, configFile);
+      config = applyEnvOverrides(configFile);
+      addLog("[配置] 已保存");
+
+      if (monitorRunning) {
+        stopMonitor();
+        startMonitor();
+        addLog("[配置] 已重启监控以应用新配置");
+      }
+
+      return res.json({ ok: true, config: redactSecrets(config) });
+    } catch (e) {
+      const err = safeString(e?.message || e);
+      addLog(`[配置] 保存失败：${err}`);
+      return res.status(500).json({ error: err });
     }
-
-    configFile = next;
-    await writeJson(CONFIG_PATH, configFile);
-    config = applyEnvOverrides(configFile);
-    addLog("[配置] 已保存");
-
-    if (monitorRunning) {
-      stopMonitor();
-      startMonitor();
-      addLog("[配置] 已重启监控以应用新配置");
-    }
-
-    res.json({ ok: true, config: redactSecrets(config) });
   });
 
   async function handleTestFetch(req, res) {
-    const targets = getTargetsFromConfig();
-    const userName = normalizeScreenName(req.query.username || targets[0] || "");
-    if (!userName) return res.status(400).json({ error: "缺少 username 或未配置目标账号" });
-    if (!config?.twitterApi?.apiKey) return res.status(400).json({ error: "请先配置 API Key" });
-
-    addLog(`[测试] 手动抓取：@${userName}`);
-    let apiRes;
     try {
-      apiRes = await twitterGetLastTweets(config, userName);
+      const targets = getTargetsFromConfig();
+      const userName = normalizeScreenName(req.query.username || targets[0] || "");
+      if (!userName) return res.status(400).json({ error: "缺少 username 或未配置目标账号" });
+      if (!config?.twitterApi?.apiKey) return res.status(400).json({ error: "请先配置 API Key" });
+
+      addLog(`[测试] 手动抓取：@${userName}`);
+      let apiRes;
+      try {
+        apiRes = await twitterGetLastTweets(config, userName);
+      } catch (e) {
+        return res.status(502).json({ error: formatAxiosError(e) });
+      }
+
+      const tweets = extractTweetArrayFromApiResponse(apiRes.data);
+      const classifiedTweets = tweets.slice(0, 5).map((t) => {
+        const id = extractTweetId(t);
+        const kind = classifyTweet(t).kind;
+        const text = extractTweetText(t);
+        return { id, kind, text };
+      });
+
+      return res.json({
+        ok: true,
+        httpStatus: apiRes.status,
+        api: apiRes.data,
+        classifiedTweets,
+      });
     } catch (e) {
-      return res.status(502).json({ error: formatAxiosError(e) });
+      const err = safeString(e?.message || e);
+      addLog(`[测试] 手动抓取失败：${err}`);
+      return res.status(500).json({ error: err });
     }
-
-    const tweets = extractTweetArrayFromApiResponse(apiRes.data);
-    const classifiedTweets = tweets.slice(0, 5).map((t) => {
-      const id = extractTweetId(t);
-      const kind = classifyTweet(t).kind;
-      const text = extractTweetText(t);
-      return { id, kind, text };
-    });
-
-    return res.json({
-      ok: true,
-      httpStatus: apiRes.status,
-      api: apiRes.data,
-      classifiedTweets,
-    });
   }
 
   async function handleTestPost(req, res) {
@@ -1672,7 +2488,7 @@ async function main() {
     let apiRes;
     try {
       stats.xCalls += 1;
-      apiRes = await xClient.v2.tweet(truncateTweetText(text, 280));
+      apiRes = await xClient.v2.post("tweets", { text: truncateTweetText(text, 280) }, { timeout: X_REQUEST_TIMEOUT_MS });
     } catch (e) {
       return res.status(502).json({ error: formatXError(e) });
     }
@@ -1775,7 +2591,7 @@ async function main() {
     let apiRes;
     try {
       stats.xCalls += 1;
-      apiRes = await xClient.v2.tweet(payload);
+      apiRes = await xClient.v2.post("tweets", payload, { timeout: X_REQUEST_TIMEOUT_MS });
     } catch (e) {
       return res.status(502).json({ error: formatXError(e) });
     }
@@ -1803,7 +2619,7 @@ async function main() {
     let apiRes;
     try {
       stats.xCalls += 1;
-      apiRes = await xClient.v2.me();
+      apiRes = await xClient.v2.get("users/me", {}, { timeout: X_REQUEST_TIMEOUT_MS });
     } catch (e) {
       return res.status(502).json({ error: formatXError(e) });
     }
@@ -1822,13 +2638,19 @@ async function main() {
   });
 
 	  app.post("/api/monitor/run-once", async (_req, res) => {
-	    await monitorTick("manual");
-	    await processQueue();
-	    res.json({
-	      ok: true,
-	      message: "已执行一次轮询",
-	      stats: { apiCalls: stats.apiCalls, xCalls: stats.xCalls, translateCalls: stats.translateCalls, queueSize: Array.isArray(db?.queue) ? db.queue.length : 0 },
-	    });
+	    try {
+	      await monitorTick("manual");
+	      await processQueue();
+	      return res.json({
+	        ok: true,
+	        message: "已执行一次轮询",
+	        stats: { apiCalls: stats.apiCalls, xCalls: stats.xCalls, translateCalls: stats.translateCalls, queueSize: Array.isArray(db?.queue) ? db.queue.length : 0 },
+	      });
+	    } catch (e) {
+	      const err = safeString(e?.message || e);
+	      addLog(`[监控] 手动执行失败：${err}`);
+	      return res.status(502).json({ error: err });
+	    }
 	  });
 
   app.get("/api/logs", async (_req, res) => {
@@ -1850,21 +2672,440 @@ async function main() {
   });
 
   app.post("/api/queue/clear", async (req, res) => {
-    const target = normalizeScreenName(req.body?.target || "");
-    if (!Array.isArray(db.queue)) db.queue = [];
+    try {
+      const target = normalizeScreenName(req.body?.target || "");
+      if (!Array.isArray(db.queue)) db.queue = [];
 
-    const before = db.queue.length;
-    if (target) {
-      db.queue = db.queue.filter((q) => normalizeScreenName(q?.target || "") !== target);
-    } else {
-      db.queue = [];
+      const before = db.queue.length;
+      if (target) {
+        db.queue = db.queue.filter((q) => normalizeScreenName(q?.target || "") !== target);
+      } else {
+        db.queue = [];
+      }
+      const removed = before - db.queue.length;
+
+      await writeJson(DB_PATH, db);
+      addLog(`[队列] 已清空${target ? `：@${target}` : ""} removed=${removed}`);
+      return res.json({ ok: true, removed, queueSize: db.queue.length });
+    } catch (e) {
+      const err = safeString(e?.message || e);
+      addLog(`[队列] 清空失败：${err}`);
+      return res.status(500).json({ error: err });
     }
-    const removed = before - db.queue.length;
-
-    await writeJson(DB_PATH, db);
-    addLog(`[队列] 已清空${target ? `：@${target}` : ""} removed=${removed}`);
-    res.json({ ok: true, removed, queueSize: db.queue.length });
   });
+
+  // =========================
+  // 批量起号（多账号定时发帖）
+  // =========================
+
+  app.get("/api/bulk/config", async (_req, res) => {
+    res.json({ config: bulkConfig });
+  });
+
+  app.get("/api/bulk/debug", async (_req, res) => {
+    res.json({
+      ok: true,
+      pkg: Boolean(process.pkg),
+      execPath: process.execPath,
+      node: process.version,
+      appDir: APP_DIR,
+      dataDir: DATA_DIR,
+      publicDir: PUBLIC_DIR,
+      bulkConfigPath: BULK_CONFIG_PATH,
+      bulkImagesDefaultDir: BULK_IMAGES_DEFAULT_DIR,
+      imageDirValue: safeString(bulkConfig?.imageDir).trim(),
+      imageDirResolved: resolveBulkImageDir(bulkConfig),
+    });
+  });
+
+  app.post("/api/bulk/config", async (req, res) => {
+    try {
+      const incoming = req.body || {};
+      const nextFile = normalizeBulkConfig(incoming);
+      const ensured2 = ensureBulkAccountIds(nextFile);
+
+      const wasRunning = bulkRunning;
+      if (wasRunning) stopBulkScheduler();
+
+      bulkConfigFile = ensured2.config;
+      await writeJson(BULK_CONFIG_PATH, bulkConfigFile);
+      bulkConfig = normalizeBulkConfig(bulkConfigFile);
+
+      addBulkLog("[配置] 已保存");
+
+      await scanBulkImages("config-save");
+      if (wasRunning) startBulkScheduler();
+
+      return res.json({ ok: true, config: bulkConfig });
+    } catch (e) {
+      const err = safeString(e?.message || e);
+      addBulkLog(`[配置] 保存失败：${err}`);
+      return res.status(500).json({ error: err });
+    }
+  });
+
+  app.get("/api/bulk/status", async (_req, res) => {
+    const accounts = getBulkAccounts().map((a) => {
+      const id = safeString(a?.id).trim();
+      const state = id ? bulkStates.get(id) : null;
+      const creds = getBulkXCredentials(a);
+      const hasCreds = Boolean(creds.appKey && creds.appSecret && creds.accessToken && creds.accessSecret);
+      return {
+        id,
+        name: safeString(a?.name).trim(),
+        enabled: Boolean(a?.enabled),
+        dryRun: Boolean(a?.dryRun),
+        proxy: redactUrlCredentials(safeString(a?.proxy).trim()),
+        schedule: a?.schedule || {},
+        hasCreds,
+        state: state || { running: false, nextPostAt: "", lastPostAt: "", posts: 0, lastError: "", lastTweetId: "" },
+      };
+    });
+
+    res.json({
+      ok: true,
+      running: bulkRunning,
+      imageDir: resolveBulkImageDir(bulkConfig),
+      images: { count: Array.isArray(bulkImagesCache?.images) ? bulkImagesCache.images.length : 0, scannedAt: bulkImagesCache?.scannedAt || "" },
+      accounts,
+    });
+  });
+
+  app.post("/api/bulk/start", async (_req, res) => {
+    if (!bulkRunning) startBulkScheduler();
+    res.json({ ok: true, running: bulkRunning });
+  });
+
+  app.post("/api/bulk/stop", async (_req, res) => {
+    stopBulkScheduler();
+    res.json({ ok: true, running: bulkRunning });
+  });
+
+  app.post("/api/bulk/run-once", async (req, res) => {
+    const accountId = safeString(req.body?.accountId).trim();
+    if (!accountId) return res.status(400).json({ error: "缺少 accountId" });
+
+    const a = findBulkAccount(accountId);
+    if (!a) return res.status(404).json({ error: "账号不存在" });
+
+    const state = upsertBulkState(a.id);
+    if (!state) return res.status(500).json({ error: "账号状态异常" });
+    if (state.running) return res.status(409).json({ error: "该账号正在发帖中" });
+
+    state.running = true;
+    state.lastError = "";
+    try {
+      const result = await bulkPostOnce(a, { trigger: "manual" });
+      if (!result?.skipped) state.posts = Number(state.posts || 0) + 1;
+      state.lastPostAt = nowIso();
+
+      if (bulkRunning) {
+        const delayMs = computeBulkDelayMs(a.schedule);
+        state.nextPostAt = new Date(Date.now() + delayMs).toISOString();
+        scheduleBulkNext(a.id, delayMs);
+      }
+
+      return res.json({ ok: true, result, state });
+    } catch (e) {
+      state.lastError = safeString(e?.message || e);
+      addBulkLog(`[手动] 发帖失败 account=${safeString(a.name || a.id)} error=${state.lastError}`);
+      return res.status(502).json({ error: state.lastError, state });
+    } finally {
+      state.running = false;
+    }
+  });
+
+  app.post("/api/bulk/test-x-auth", async (req, res) => {
+    const accountId = safeString(req.body?.accountId).trim();
+    if (!accountId) return res.status(400).json({ error: "缺少 accountId" });
+
+    const a = findBulkAccount(accountId);
+    if (!a) return res.status(404).json({ error: "账号不存在" });
+
+    let xClient;
+    let proxyUrl;
+    try {
+      const created = createXClientForBulkAccount(a);
+      xClient = created.client;
+      proxyUrl = created.proxyUrl;
+    } catch (e) {
+      return res.status(400).json({ error: safeString(e?.message || e) });
+    }
+
+    let me;
+    try {
+      stats.xCalls += 1;
+      me = await xClient.v2.get("users/me", {}, { timeout: X_REQUEST_TIMEOUT_MS });
+    } catch (e) {
+      return res.status(502).json({ error: formatXErrorVerbose(e, { proxy: proxyUrl }) });
+    }
+
+    return res.json({ ok: true, proxy: redactUrlCredentials(proxyUrl), me });
+  });
+
+  app.get("/api/bulk/logs", async (_req, res) => {
+    res.json({ logs: bulkLogs, running: bulkRunning });
+  });
+
+  app.post("/api/bulk/logs/clear", async (_req, res) => {
+    bulkLogs.splice(0, bulkLogs.length);
+    res.json({ ok: true });
+  });
+
+  app.get("/api/bulk/images", async (_req, res) => {
+    try {
+      const cache = await scanBulkImages("manual");
+      return res.json({
+        ok: true,
+        dir: cache.dir,
+        scannedAt: cache.scannedAt,
+        images: (cache.images || []).map((i) => ({
+          name: i.name,
+          size: i.size,
+          mtimeMs: i.mtimeMs,
+          url: `/api/bulk/image?name=${encodeURIComponent(i.name)}&v=${encodeURIComponent(String(i.mtimeMs || 0))}`,
+        })),
+      });
+    } catch (e) {
+      const err = safeString(e?.message || e);
+      addBulkLog(`[图库] 列表获取失败：${err}`);
+      return res.status(500).json({ error: err });
+    }
+  });
+
+  app.post("/api/bulk/images/refresh", async (_req, res) => {
+    try {
+      const cache = await scanBulkImages("refresh");
+      return res.json({ ok: true, dir: cache.dir, scannedAt: cache.scannedAt, count: (cache.images || []).length });
+    } catch (e) {
+      const err = safeString(e?.message || e);
+      addBulkLog(`[图库] 刷新失败：${err}`);
+      return res.status(500).json({ error: err });
+    }
+  });
+
+  app.get("/api/bulk/image", async (req, res) => {
+    const dir = resolveBulkImageDir(bulkConfig);
+    if (!dir) return res.status(400).json({ error: "未配置图片目录（imageDir）" });
+
+    const name = safeString(req.query?.name).trim();
+    if (!name) return res.status(400).json({ error: "缺少 name" });
+
+    const safeName = path.basename(name);
+    if (!safeName || !isImageFileName(safeName)) return res.status(400).json({ error: "文件名不合法或非图片" });
+
+    const baseDir = path.resolve(dir);
+    const fullPath = path.resolve(baseDir, safeName);
+    const baseDirLower = baseDir.toLowerCase();
+    const fullLower = fullPath.toLowerCase();
+    if (!fullLower.startsWith(`${baseDirLower}${path.sep}`)) return res.status(400).json({ error: "路径不合法" });
+
+    try {
+      await fs.access(fullPath);
+    } catch {
+      return res.status(404).json({ error: "文件不存在" });
+    }
+
+    return res.sendFile(fullPath);
+  });
+
+  app.put("/api/bulk/upload", express.raw({ type: "*/*", limit: "25mb" }), async (req, res) => {
+    try {
+      const dir = resolveBulkImageDir(bulkConfig);
+      if (!dir) return res.status(400).json({ error: "未配置图片目录（imageDir）" });
+
+      const body = req.body;
+      if (!Buffer.isBuffer(body) || body.length === 0) return res.status(400).json({ error: "缺少文件内容" });
+
+      let fileName = safeString(req.query?.filename).trim() || safeString(req.headers["x-filename"]).trim();
+      if (!fileName) return res.status(400).json({ error: "缺少 filename（query 或 x-filename）" });
+
+      fileName = path.basename(fileName);
+      fileName = fileName.replace(/[<>:"/\\|?*\u0000-\u001f]/g, "_").replace(/\s+/g, " ").trim();
+      if (!fileName) return res.status(400).json({ error: "filename 不合法" });
+
+      const contentType = safeString(req.headers["content-type"]).trim().toLowerCase();
+      if (!isImageFileName(fileName)) {
+        if (contentType === "image/jpeg") fileName += ".jpg";
+        else if (contentType === "image/png") fileName += ".png";
+        else if (contentType === "image/gif") fileName += ".gif";
+        else if (contentType === "image/webp") fileName += ".webp";
+      }
+      if (!isImageFileName(fileName)) return res.status(400).json({ error: "仅支持 jpg/jpeg/png/gif/webp" });
+
+      await fs.mkdir(dir, { recursive: true });
+
+      const ext = path.extname(fileName);
+      const base = path.basename(fileName, ext);
+      let finalName = fileName;
+
+      const targetPath = () => path.join(dir, finalName);
+      if (await fileExists(targetPath())) {
+        const suffix = generateId("u").split("_").slice(-2).join("_");
+        finalName = `${base}-${suffix}${ext}`;
+      }
+
+      await fs.writeFile(targetPath(), body);
+      addBulkLog(`[上传] 已保存：${finalName} size=${body.length}`);
+
+      await scanBulkImages("upload");
+
+      return res.json({ ok: true, fileName: finalName });
+    } catch (e) {
+      const err = safeString(e?.message || e);
+      addBulkLog(`[上传] 失败：${err}`);
+      return res.status(500).json({ error: err });
+    }
+  });
+
+  async function loginTwitterViaBrowser(account) {
+    const exe = findLocalBrowser();
+    if (!exe) throw new Error("未找到本地 Chrome 或 Edge 浏览器，无法打开登录窗口。");
+
+    const a = account && typeof account === "object" ? account : null;
+    const accountId = safeString(a?.id).trim() || "acc";
+    const profileDirValue = safeString(a?.x?.profileDir).trim() || defaultBulkBrowserProfileDirValue(accountId);
+    const profileDir = resolveAppDirPath(profileDirValue);
+
+    if (!profileDir) throw new Error("Profile 目录解析失败");
+    await fs.mkdir(profileDir, { recursive: true });
+
+    const proxyUrl = safeString(a?.proxy).trim() || getXProxyUrlFromEnv();
+
+    console.log(`[Login] Launching browser: ${exe} profile=${profileDir}`);
+
+    let browser;
+    try {
+      const args = [
+        "--disable-blink-features=AutomationControlled",
+        "--no-first-run",
+        "--no-default-browser-check",
+        "--disable-infobars",
+        "--window-position=0,0",
+        "--window-size=1280,800",
+      ];
+      if (proxyUrl) args.push(`--proxy-server=${proxyUrl}`);
+
+      browser = await puppeteer.launch({
+        executablePath: exe,
+        headless: false,
+        defaultViewport: null,
+        userDataDir: profileDir,
+        ignoreDefaultArgs: ["--enable-automation"],
+        args,
+      });
+    } catch (e) {
+      throw new Error(`启动浏览器失败: ${e.message}`);
+    }
+
+    const pages = await browser.pages();
+    const page = pages[0] || (await browser.newPage());
+
+    try {
+      await page.goto("https://x.com/i/flow/login", { waitUntil: "networkidle2", timeout: 60000 });
+    } catch (e) {
+      console.log(`[Login] Nav warning: ${e.message}`);
+    }
+
+    return new Promise((resolve, reject) => {
+      let checkTimer = null;
+      let timeoutTimer = null;
+      let injected = false;
+
+      const cleanup = () => {
+        clearInterval(checkTimer);
+        clearTimeout(timeoutTimer);
+        browser.close().catch(() => {});
+      };
+
+      checkTimer = setInterval(async () => {
+        try {
+          if (browser.process()?.killed) {
+            cleanup();
+            reject(new Error("浏览器已关闭"));
+            return;
+          }
+
+          if (!injected) {
+            injected = true;
+            page
+              .evaluate(() => {
+                try {
+                  const div = document.createElement("div");
+                  div.id = "x-login-helper";
+                  div.style =
+                    "position:fixed;top:0;left:0;right:0;background:#1d9bf0;color:white;z-index:99999;padding:12px;text-align:center;font-family:sans-serif;box-shadow:0 2px 10px rgba(0,0,0,0.2);";
+                  div.innerHTML = `
+                    <div style="font-size:16px;font-weight:bold;margin-bottom:4px;">🔐 请完成登录</div>
+                    <div style="font-size:13px;opacity:0.95;">
+                      可选择「Continue with Google」或账号密码登录；登录成功后保持在首页，窗口会自动关闭。
+                    </div>
+                  `;
+                  document.body.appendChild(div);
+                } catch {}
+              })
+              .catch(() => {});
+          }
+
+          const loggedIn = await page
+            .evaluate(() => {
+              return Boolean(
+                document.querySelector('[data-testid="SideNav_AccountSwitcher_Button"]') ||
+                  document.querySelector('[data-testid="SideNav_NewTweet_Button"]'),
+              );
+            })
+            .catch(() => false);
+
+          if (loggedIn) {
+            cleanup();
+            resolve({ profileDir: profileDirValue });
+          }
+        } catch {}
+      }, 1000);
+
+      timeoutTimer = setTimeout(() => {
+        cleanup();
+        reject(new Error("操作超时（3分钟），请重试"));
+      }, 180_000);
+    });
+  }
+
+  async function handleBulkOpenLogin(req, res) {
+    try {
+      const { accountId } = req.body || {};
+      if (!accountId) throw new Error("缺少 accountId");
+
+      const acc = findBulkAccount(accountId);
+      if (!acc) throw new Error("账号未找到");
+      if (!acc.x) acc.x = {};
+
+      // 若未设置，则为该账号分配一个默认 Profile 目录（相对 APP_DIR）
+      if (!safeString(acc.x.profileDir).trim()) {
+        acc.x.profileDir = defaultBulkBrowserProfileDirValue(acc.id);
+      }
+
+      const result = await loginTwitterViaBrowser(acc);
+      if (result?.profileDir) acc.x.profileDir = safeString(result.profileDir).trim() || acc.x.profileDir;
+
+      // 采用 Profile 方式后，不再需要 Cookie/QueryId（避免误用旧值）
+      acc.x.cookieString = "";
+      acc.x.queryId = "";
+
+      ensureBulkAccountIds(bulkConfig);
+      await writeJson(BULK_CONFIG_PATH, bulkConfig);
+
+      addBulkLog(`[登录] 已保存浏览器 Profile：account=${safeString(acc.name || acc.id)} dir=${safeString(acc.x.profileDir)}`);
+      return res.json({ ok: true, msg: "登录完成，已保存 Profile（后续发帖将复用）", profileDir: acc.x.profileDir });
+    } catch (e) {
+      const err = safeString(e?.message || e);
+      addBulkLog(`[登录] 失败：${err}`);
+      return res.status(500).json({ error: err });
+    }
+  }
+
+  // 浏览器登录（推荐）：保存 Profile；兼容旧按钮路径
+  app.post("/api/bulk/open-login", handleBulkOpenLogin);
+  app.post("/api/bulk/auto-cookie", handleBulkOpenLogin);
 
   async function listenWithFallback(startPort) {
     let port = startPort;

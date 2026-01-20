@@ -25,15 +25,30 @@ function setJsonBox(obj) {
 }
 
 function setStatusBadge(status) {
-  const el = byId("monitorStatus");
-  el.textContent = `监控：${status.running ? "运行中" : "已停止"}`;
-  el.className = `badge ${status.running ? "text-bg-success" : "text-bg-secondary"}`;
+  const dot = byId("statusDot");
+  const text = byId("monitorStatusText");
+  const btnStart = byId("btnStartMonitor");
+  const btnStop = byId("btnStopMonitor");
+
+  if (status.running) {
+    dot.className = "status-indicator running";
+    text.textContent = "运行中";
+    text.className = "small fw-bold text-success";
+    btnStart.disabled = true;
+    btnStop.disabled = false;
+  } else {
+    dot.className = "status-indicator stopped";
+    text.textContent = "已停止";
+    text.className = "small fw-medium text-secondary";
+    btnStart.disabled = false;
+    btnStop.disabled = true;
+  }
 }
 
 function renderFilterTable(items) {
   const tbody = byId("filterTableBody");
   if (!items || items.length === 0) {
-    tbody.innerHTML = `<tr><td colspan="3" class="text-secondary">暂无数据</td></tr>`;
+    tbody.innerHTML = `<tr><td colspan="3" class="text-secondary text-center p-3">暂无数据</td></tr>`;
     return;
   }
   tbody.innerHTML = items
@@ -41,20 +56,20 @@ function renderFilterTable(items) {
       const kind = t.kind || "unknown";
       const badgeClass =
         kind === "original"
-          ? "text-bg-success"
+          ? "bg-success"
           : kind === "retweet"
-            ? "text-bg-info"
+            ? "bg-info text-dark"
             : kind === "reply"
-              ? "text-bg-warning"
+              ? "bg-warning text-dark"
               : kind === "quote"
-                ? "text-bg-primary"
-                : "text-bg-secondary";
+                ? "bg-primary"
+                : "bg-secondary";
       const text = (t.text || "").replace(/\s+/g, " ").trim();
       const short = text.length > 120 ? `${text.slice(0, 120)}…` : text;
       return `<tr>
         <td><span class="badge ${badgeClass}">${kind}</span></td>
-        <td title="${escapeHtml(text)}">${escapeHtml(short)}</td>
-        <td class="font-monospace">${escapeHtml(t.id || "")}</td>
+        <td><div class="text-truncate" style="max-width: 400px;" title="${escapeHtml(text)}">${escapeHtml(short)}</div></td>
+        <td class="font-monospace text-muted" style="font-size: 0.85em;">${escapeHtml(t.id || "")}</td>
       </tr>`;
     })
     .join("");
@@ -126,6 +141,11 @@ async function fetchLatest() {
   const path = username ? `/api/test-fetch?username=${encodeURIComponent(username)}` : "/api/test-fetch";
   const res = await api(path);
   setJsonBox(res);
+  
+  // Switch tab
+  const tab = bootstrap.Tab.getOrCreateInstance(document.querySelector('a[href="#tabFilter"]'));
+  tab.show();
+  
   renderFilterTable(res?.classifiedTweets || []);
 }
 
@@ -153,6 +173,8 @@ async function testRepost() {
 async function testXAuth() {
   const res = await api("/api/test-x-auth");
   setJsonBox(res);
+  const tab = bootstrap.Tab.getOrCreateInstance(document.querySelector('a[href="#tabApi"]'));
+  tab.show();
 }
 
 async function startMonitor() {
@@ -194,11 +216,18 @@ async function refreshLogs() {
   const lines = (data?.logs || []).map((l) => `[${l.time}] ${l.message}`);
   byId("logBox").textContent = lines.join("\n");
   setStatusBadge(data?.monitor || { running: false });
-  byId("statsBar").textContent = `调用次数：${data?.stats?.apiCalls ?? 0} | X 调用：${data?.stats?.xCalls ?? 0} | 翻译：${data?.stats?.translateCalls ?? 0} | 队列：${data?.stats?.queueSize ?? 0}`;
+  
+  // Update Navbar Stats
+  byId("statApiCalls").textContent = data?.stats?.apiCalls ?? 0;
+  byId("statXCalls").textContent = data?.stats?.xCalls ?? 0;
+  byId("statTranslateCalls").textContent = data?.stats?.translateCalls ?? 0;
+  byId("statQueueSize").textContent = data?.stats?.queueSize ?? 0;
 }
 
 function bind(id, event, handler) {
-  byId(id).addEventListener(event, async (e) => {
+  const el = byId(id);
+  if(!el) return;
+  el.addEventListener(event, async (e) => {
     e.preventDefault();
     try {
       await handler(e);

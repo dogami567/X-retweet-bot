@@ -1,0 +1,313 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>X-Bulk Dispatcher</title>
+    <!-- Bootstrap 5 CSS -->
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet" />
+    <!-- Bootstrap Icons -->
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.3/font/bootstrap-icons.min.css">
+    <!-- Google Fonts: Inter -->
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <!-- Navbar -->
+    <nav class="navbar navbar-expand-lg navbar-light bg-white border-bottom sticky-top" style="z-index: 1040;">
+      <div class="container-fluid px-4">
+        <a class="navbar-brand d-flex align-items-center gap-2 fw-semibold" href="#">
+          <i class="bi bi-robot text-primary"></i>
+          X-Bulk
+        </a>
+        <div class="d-flex align-items-center gap-3">
+            <div class="d-flex align-items-center" id="statusIndicatorBox">
+                <span class="status-indicator stopped" id="statusDot"></span>
+                <span class="small fw-medium text-secondary" id="bulkRunningText">Stopped</span>
+            </div>
+            <div class="vr mx-2"></div>
+            <button class="btn btn-sm btn-success d-flex align-items-center gap-2 px-3" id="btnBulkStart">
+                <i class="bi bi-play-fill"></i> 启动
+            </button>
+            <button class="btn btn-sm btn-outline-danger d-flex align-items-center gap-2 px-3" id="btnBulkStop">
+                <i class="bi bi-stop-fill"></i> 停止
+            </button>
+            <a class="btn btn-sm btn-light text-secondary border" href="/">
+                <i class="bi bi-box-arrow-right"></i>
+            </a>
+        </div>
+      </div>
+    </nav>
+
+    <div class="container-fluid px-4 py-4">
+      <div class="row g-4">
+        
+        <!-- Left Column: Configuration & Accounts -->
+        <div class="col-12 col-xl-7">
+          
+          <!-- Global Settings Card -->
+          <div class="card mb-4">
+            <div class="card-header">
+                <span><i class="bi bi-sliders me-2"></i>基础配置</span>
+                <button class="btn btn-sm btn-primary" id="btnSaveConfig"><i class="bi bi-save me-1"></i>保存全局</button>
+            </div>
+            <div class="card-body">
+                <div class="row g-3 align-items-end">
+                    <div class="col-md-8">
+                        <label class="form-label small text-muted">图片资源目录</label>
+                        <div class="input-group">
+                            <span class="input-group-text bg-light"><i class="bi bi-folder2-open"></i></span>
+                            <input class="form-control mono" id="imageDir" placeholder="默认: data/bulk-images">
+                        </div>
+                        <div class="form-text small text-truncate" id="resolvedImageDir">当前: -</div>
+                    </div>
+                    <div class="col-md-4">
+                         <label class="form-label small text-muted">图库扫描间隔 (秒)</label>
+                         <input class="form-control" type="number" id="scanIntervalSec" value="3600">
+                    </div>
+                </div>
+            </div>
+          </div>
+
+          <!-- Accounts Management -->
+          <div class="card" style="min-height: 600px;">
+            <div class="card-header">
+                <span><i class="bi bi-people me-2"></i>账号管理</span>
+                <div class="d-flex gap-2">
+                    <button class="btn btn-xs btn-outline-primary py-1" id="btnAddAccount"><i class="bi bi-plus-lg"></i></button>
+                    <button class="btn btn-xs btn-outline-danger py-1" id="btnDeleteAccount"><i class="bi bi-trash"></i></button>
+                </div>
+            </div>
+            <div class="card-body p-0">
+                <div class="row g-0 h-100">
+                    <!-- Account List Sidebar -->
+                    <div class="col-md-4 account-sidebar bg-light h-100 border-end">
+                        <div class="list-group list-group-flush" id="accountList" style="max-height: 600px; overflow-y: auto;">
+                            <!-- Items injected by JS -->
+                            <div class="p-3 text-center text-muted small">加载中...</div>
+                        </div>
+                    </div>
+                    
+                    <!-- Account Detail Form -->
+                    <div class="col-md-8 bg-white">
+                        <div class="p-4">
+                            <div class="d-flex justify-content-between align-items-center mb-4">
+                                <h6 class="fw-bold mb-0 text-primary">账号详情</h6>
+                                <div class="btn-group">
+                                    <button class="btn btn-sm btn-outline-secondary" id="btnTestXAuth" title="验证凭证"><i class="bi bi-shield-check"></i> 验证</button>
+                                    <button class="btn btn-sm btn-outline-secondary" id="btnRunOnce" title="立即发送一条"><i class="bi bi-send"></i> 手动发送</button>
+                                </div>
+                            </div>
+
+                            <form id="accountForm" class="row g-3">
+                                <div class="col-12">
+                                    <div class="input-group input-group-sm">
+                                        <span class="input-group-text text-muted">ID</span>
+                                        <input class="form-control mono bg-light" id="accId" disabled>
+                                    </div>
+                                </div>
+                                
+                                <div class="col-md-6">
+                                    <label class="form-label small fw-medium">显示名称</label>
+                                    <input class="form-control" id="accName" placeholder="例如: 账号 A">
+                                </div>
+                                
+                                <div class="col-md-6 d-flex align-items-end gap-3">
+                                    <div class="form-check form-switch mb-2">
+                                        <input class="form-check-input" type="checkbox" id="accEnabled">
+                                        <label class="form-check-label" for="accEnabled">启用</label>
+                                    </div>
+                                    <div class="form-check form-switch mb-2">
+                                        <input class="form-check-input" type="checkbox" id="accDryRun">
+                                        <label class="form-check-label text-warning" for="accDryRun">Dry Run (仅模拟)</label>
+                                    </div>
+                                </div>
+
+                                <div class="col-12">
+                                    <label class="form-label small fw-medium">代理 (Proxy)</label>
+                                    <input class="form-control mono font-monospace small" id="accProxy" placeholder="http://127.0.0.1:7890">
+                                </div>
+
+                                <div class="col-12"><hr class="text-muted opacity-25"></div>
+                                <h6 class="fw-bold text-secondary small mb-0">调度策略</h6>
+
+                                <div class="col-md-6">
+                                    <label class="form-label small text-muted">基础间隔 (分)</label>
+                                    <input class="form-control" type="number" id="accIntervalMin">
+                                </div>
+                                <div class="col-md-6">
+                                    <label class="form-label small text-muted">随机抖动 (±分)</label>
+                                    <input class="form-control" type="number" id="accJitterMin">
+                                </div>
+                                <div class="col-md-6">
+                                    <label class="form-label small text-muted">图片数量 (Min)</label>
+                                    <input class="form-control" type="number" id="accImagesMin" min="0" max="4">
+                                </div>
+                                <div class="col-md-6">
+                                    <label class="form-label small text-muted">图片数量 (Max)</label>
+                                    <input class="form-control" type="number" id="accImagesMax" min="0" max="4">
+                                </div>
+
+                                <div class="col-12"><hr class="text-muted opacity-25"></div>
+                                <h6 class="fw-bold text-secondary small mb-0">API 凭证 (优先)</h6>
+
+                                <div class="col-md-6">
+                                    <input class="form-control form-control-sm mono" type="password" id="xApiKey" placeholder="API Key">
+                                </div>
+                                <div class="col-md-6">
+                                    <input class="form-control form-control-sm mono" type="password" id="xApiSecret" placeholder="API Secret">
+                                </div>
+                                <div class="col-md-6">
+                                    <input class="form-control form-control-sm mono" type="password" id="xAccessToken" placeholder="Access Token">
+                                </div>
+                                <div class="col-md-6">
+                                    <input class="form-control form-control-sm mono" type="password" id="xAccessSecret" placeholder="Access Secret">
+                                </div>
+
+                                <div class="col-12 mt-3">
+                                    <div class="d-flex justify-content-between align-items-end mb-1">
+                                        <label class="form-label small fw-bold text-secondary mb-0">浏览器登录 (推荐：不需要 Cookie)</label>
+                                        <button class="btn btn-xs btn-outline-primary" id="btnOpenLogin" type="button">
+                                            <i class="bi bi-box-arrow-in-right"></i> 打开浏览器登录
+                                        </button>
+                                    </div>
+                                    
+                                    <div class="input-group input-group-sm">
+                                        <span class="input-group-text text-muted">Profile</span>
+                                        <input class="form-control mono bg-light" id="xProfileDir" disabled placeholder="未绑定（先点右侧按钮登录）">
+                                    </div>
+                                    <div class="form-text small">
+                                        首次点击会打开本机 Chrome/Edge，请手动完成登录（可选 Google 登录）。成功后会为该账号保存独立浏览器资料，后续发帖直接复用。
+                                    </div>
+                                </div>
+                            </form>
+                        </div>
+                    </div>
+                </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Right Column: Assets & Monitor -->
+        <div class="col-12 col-xl-5">
+            
+            <!-- Captions -->
+            <div class="card mb-4">
+                <div class="card-header">
+                    <span><i class="bi bi-chat-quote me-2"></i>文案库 (<span id="captionCount">0</span>)</span>
+                    <div class="d-flex gap-1">
+                        <button class="btn btn-xs btn-outline-secondary" id="btnCaptionClear" title="清空"><i class="bi bi-trash3"></i></button>
+                        <button class="btn btn-xs btn-outline-secondary" id="btnImportTxt" title="导入"><i class="bi bi-upload"></i></button>
+                        <input type="file" id="captionTxt" hidden accept=".txt">
+                    </div>
+                </div>
+                <div class="card-body">
+                    <div class="d-flex gap-3" style="height: 240px;">
+                        <div class="list-group overflow-auto w-25 small" id="captionList">
+                            <!-- JS Injected -->
+                        </div>
+                        <div class="d-flex flex-column flex-grow-1 gap-2">
+                            <textarea class="form-control flex-grow-1" id="captionEditor" placeholder="输入文案..."></textarea>
+                            <div class="d-flex gap-2 justify-content-end">
+                                <button class="btn btn-sm btn-light border" id="btnCaptionUpdate">更新</button>
+                                <button class="btn btn-sm btn-primary" id="btnCaptionAdd">新增</button>
+                                <button class="btn btn-sm btn-danger" id="btnCaptionDelete">删除</button>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Gallery -->
+            <div class="card mb-4">
+                <div class="card-header">
+                    <span><i class="bi bi-images me-2"></i>图库</span>
+                    <div class="d-flex gap-2">
+                        <button class="btn btn-xs btn-outline-primary" onclick="document.getElementById('uploadFiles').click()">
+                            <i class="bi bi-cloud-upload"></i> 上传
+                        </button>
+                        <button class="btn btn-xs btn-outline-secondary" id="btnRefreshImages">
+                            <i class="bi bi-arrow-clockwise"></i>
+                        </button>
+                        <input type="file" id="uploadFiles" multiple hidden accept="image/*">
+                        <input type="file" id="uploadFolder" webkitdirectory hidden>
+                    </div>
+                </div>
+                <div class="card-body">
+                    <!-- Upload Preview -->
+                    <div id="uploadSelectionInfo" class="small text-primary mb-2 fw-bold" style="display:none;"></div>
+                    <div id="uploadPreview" class="gallery-grid mb-3"></div>
+                    
+                    <!-- Main Gallery -->
+                    <div class="small text-muted mb-2" id="galleryInfo">正在加载...</div>
+                    <div id="gallery" class="gallery-grid" style="max-height: 300px; overflow-y: auto; padding-right: 4px;">
+                        <!-- JS Injected -->
+                    </div>
+                </div>
+            </div>
+
+            <!-- Status & Logs -->
+            <div class="card">
+                <div class="card-header">
+                    <ul class="nav nav-tabs card-header-tabs">
+                        <li class="nav-item">
+                            <a class="nav-link active" data-bs-toggle="tab" href="#tabStatus">状态</a>
+                        </li>
+                        <li class="nav-item">
+                            <a class="nav-link" data-bs-toggle="tab" href="#tabLogs">日志</a>
+                        </li>
+                        <li class="nav-item">
+                            <a class="nav-link" data-bs-toggle="tab" href="#tabApi">调试</a>
+                        </li>
+                    </ul>
+                    <button class="btn btn-xs btn-link text-muted" id="btnRefreshStatus"><i class="bi bi-arrow-repeat"></i></button>
+                </div>
+                <div class="card-body p-0">
+                    <div class="tab-content">
+                        <div class="tab-pane fade show active" id="tabStatus">
+                            <div class="table-responsive">
+                                <table class="table table-hover table-sm mb-0 small align-middle">
+                                    <thead class="bg-light">
+                                        <tr>
+                                            <th class="ps-3">Account</th>
+                                            <th>State</th>
+                                            <th>Next</th>
+                                            <th>Done</th>
+                                            <th>Error</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody id="statusTableBody">
+                                        <!-- JS Injected -->
+                                    </tbody>
+                                </table>
+                            </div>
+                        </div>
+                        <div class="tab-pane fade" id="tabLogs">
+                            <div class="p-0">
+                                <div class="d-flex justify-content-end p-2 border-bottom bg-light">
+                                    <button class="btn btn-xs btn-outline-secondary" id="btnClearBulkLogs">Clear</button>
+                                </div>
+                                <pre class="log-box rounded-0 border-0 m-0" id="bulkLogBox" style="height: 300px;"></pre>
+                            </div>
+                        </div>
+                        <div class="tab-pane fade" id="tabApi">
+                            <pre class="json-box rounded-0 border-0 m-0" id="apiResponse" style="height: 340px;"></pre>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+        </div>
+      </div>
+    </div>
+
+    <!-- Hidden Debug Info -->
+    <div class="d-none">
+        <span id="debugDataDir"></span>
+        <span id="debugBulkConfigPath"></span>
+    </div>
+
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
+    <script type="module" src="/bulk.js"></script>
+  </body>
+</html>
