@@ -45,7 +45,7 @@ function isLikelyImageFile(file) {
   return isImageName(f.name);
 }
 
-let config = { version: 1, imageDir: "", scanIntervalSec: 3600, defaultProxy: "", proxyPool: [], captions: [], accounts: [] };
+let config = { version: 1, imageDir: "", scanIntervalSec: 3600, captions: [], accounts: [] };
 let selectedAccountId = "";
 let selectedCaptionIndex = -1;
 let uploadPreviewObjectUrls = [];
@@ -139,22 +139,6 @@ function renderAccountForm() {
   byId("accDryRun").checked = a?.dryRun === undefined ? true : Boolean(a?.dryRun);
   byId("accProxy").value = a?.proxy || "";
 
-  const proxyPickEl = byId("accProxyPick");
-  if (proxyPickEl) {
-    const pool = Array.isArray(config.proxyPool) ? config.proxyPool : [];
-    const options = [
-      `<option value="">从代理池选择…</option>`,
-      `<option value="__CLEAR__">（使用默认代理）</option>`,
-      ...pool.map((p) => `<option value="${escapeHtml(p)}">${escapeHtml(p)}</option>`),
-    ];
-    proxyPickEl.innerHTML = options.join("");
-
-    const current = String(a?.proxy || "").trim();
-    if (!current) proxyPickEl.value = "__CLEAR__";
-    else if (pool.includes(current)) proxyPickEl.value = current;
-    else proxyPickEl.value = "";
-  }
-
   byId("accIntervalMin").value = String(a?.schedule?.intervalMin ?? 120);
   const jitterMinFallback =
     a?.schedule?.jitterMin ?? (a?.schedule?.jitterSec !== undefined ? Math.round(Number(a.schedule.jitterSec || 0) / 60) : 10);
@@ -199,42 +183,13 @@ function applyAccountFormToConfig() {
 }
 
 function applyBaseFormToConfig() {
-  const imageDirEl = byId("imageDir");
-  if (imageDirEl) config.imageDir = imageDirEl.value.trim();
-
-  const scanEl = byId("scanIntervalSec");
-  if (scanEl) config.scanIntervalSec = Number(scanEl.value || 3600);
-
-  const defaultProxyEl = byId("defaultProxy");
-  if (defaultProxyEl) config.defaultProxy = defaultProxyEl.value.trim();
-
-  const proxyPoolEl = byId("proxyPool");
-  if (proxyPoolEl) {
-    const lines = String(proxyPoolEl.value || "")
-      .split(/\r?\n/g)
-      .map((s) => s.trim())
-      .filter(Boolean);
-    const seen = new Set();
-    config.proxyPool = lines.filter((s) => {
-      if (seen.has(s)) return false;
-      seen.add(s);
-      return true;
-    });
-  }
+  config.imageDir = byId("imageDir").value.trim();
+  config.scanIntervalSec = Number(byId("scanIntervalSec").value || 3600);
 }
 
 function renderBaseForm() {
-  const imageDirEl = byId("imageDir");
-  if (imageDirEl) imageDirEl.value = config.imageDir || "";
-
-  const scanEl = byId("scanIntervalSec");
-  if (scanEl) scanEl.value = String(config.scanIntervalSec ?? 3600);
-
-  const defaultProxyEl = byId("defaultProxy");
-  if (defaultProxyEl) defaultProxyEl.value = config.defaultProxy || "";
-
-  const proxyPoolEl = byId("proxyPool");
-  if (proxyPoolEl) proxyPoolEl.value = (Array.isArray(config.proxyPool) ? config.proxyPool : []).join("\n");
+  byId("imageDir").value = config.imageDir || "";
+  byId("scanIntervalSec").value = String(config.scanIntervalSec ?? 3600);
 }
 
 function renderCaptionList() {
@@ -353,8 +308,6 @@ function generateAccountId() {
 async function loadConfig() {
   const res = await api("/api/bulk/config");
   config = res?.config || config;
-  if (typeof config.defaultProxy !== "string") config.defaultProxy = "";
-  if (!Array.isArray(config.proxyPool)) config.proxyPool = [];
   if (!Array.isArray(config.accounts)) config.accounts = [];
   if (!Array.isArray(config.captions)) config.captions = [];
 
@@ -370,8 +323,6 @@ async function saveConfig() {
   const res = await api("/api/bulk/config", { method: "POST", body: JSON.stringify(config) });
   setJsonBox(res);
   config = res?.config || config;
-  if (typeof config.defaultProxy !== "string") config.defaultProxy = "";
-  if (!Array.isArray(config.proxyPool)) config.proxyPool = [];
   if (!Array.isArray(config.accounts)) config.accounts = [];
   if (!Array.isArray(config.captions)) config.captions = [];
   renderBaseForm();
@@ -809,37 +760,8 @@ function bindAccountAutoApply() {
     const el = byId(id);
     if (el) {
         el.addEventListener("input", () => applyAccountFormToConfig());
-        el.addEventListener("change", () => applyAccountFormToConfig());
+      el.addEventListener("change", () => applyAccountFormToConfig());
     }
-  }
-
-  const pickEl = byId("accProxyPick");
-  if (pickEl) {
-    pickEl.addEventListener("change", () => {
-      const proxyEl = byId("accProxy");
-      if (!proxyEl) return;
-      const v = String(pickEl.value || "");
-      if (v === "__CLEAR__") proxyEl.value = "";
-      else if (v) proxyEl.value = v;
-      applyAccountFormToConfig();
-      renderAccountForm();
-    });
-  }
-}
-
-function bindBaseAutoApply() {
-  const ids = ["imageDir", "scanIntervalSec", "defaultProxy", "proxyPool"];
-  for (const id of ids) {
-    const el = byId(id);
-    if (!el) continue;
-    el.addEventListener("input", () => {
-      applyBaseFormToConfig();
-      renderAccountForm();
-    });
-    el.addEventListener("change", () => {
-      applyBaseFormToConfig();
-      renderAccountForm();
-    });
   }
 }
 
@@ -944,7 +866,6 @@ bind("btnOpenLogin", "click", async () => {
 });
 
 bindAccountAutoApply();
-bindBaseAutoApply();
 
 await loadConfig();
 await refreshDebug({ silent: true }).catch(() => {});

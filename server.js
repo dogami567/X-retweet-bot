@@ -482,8 +482,6 @@ function defaultBulkConfig() {
     version: 1,
     imageDir: "data/bulk-images",
     scanIntervalSec: 3600,
-    defaultProxy: "",
-    proxyPool: [],
     captions: [],
     accounts: [],
   };
@@ -760,14 +758,9 @@ function normalizeBulkConfig(raw) {
   const scan = Number(next.scanIntervalSec ?? 3600);
   next.scanIntervalSec = Number.isFinite(scan) ? Math.max(300, Math.round(scan)) : 3600;
 
-  next.defaultProxy = safeString(next.defaultProxy).trim();
-
-  if (typeof next.proxyPool === "string") next.proxyPool = next.proxyPool.split(/\r?\n/g);
-  if (!Array.isArray(next.proxyPool)) next.proxyPool = [];
-  next.proxyPool = next.proxyPool
-    .map((s) => safeString(s).trim())
-    .filter(Boolean)
-    .filter((v, idx, arr) => arr.indexOf(v) === idx);
+  // 代理按账号配置（account.proxy），不再使用全局默认/代理池
+  delete next.defaultProxy;
+  delete next.proxyPool;
 
   if (typeof next.captions === "string") next.captions = next.captions.split(/\r?\n/g);
   if (!Array.isArray(next.captions)) next.captions = [];
@@ -1795,10 +1788,6 @@ function getBulkXCredentials(account) {
 function getBulkProxyUrl(account) {
   const accProxy = safeString(account?.proxy).trim();
   if (accProxy) return accProxy;
-
-  const defaultProxy = safeString(bulkConfig?.defaultProxy).trim();
-  if (defaultProxy) return defaultProxy;
-
   return getXProxyUrlFromEnv();
 }
 
