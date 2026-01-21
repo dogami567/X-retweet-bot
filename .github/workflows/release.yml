@@ -47,7 +47,8 @@ jobs:
         run: npm run build:exe
 
       - name: Package ZIP
-        run: npm run package:exe
+        shell: pwsh
+        run: pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/package-exe.ps1
 
       - name: Rename artifact
         shell: pwsh
