@@ -10,17 +10,34 @@ permissions:
   contents: write
 
 jobs:
+  create-release:
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - name: Create GitHub Release (gh)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME}"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release already exists: $TAG"
+            exit 0
+          fi
+          gh release create "$TAG" --generate-notes --verify-tag
+
   build-windows:
     runs-on: windows-latest
+    needs: create-release
+    if: startsWith(github.ref, 'refs/tags/v')
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Setup Node
-        uses: actions/setup-node@v4
-        with:
-          node-version: 18
-          cache: npm
+      - name: Checkout (git)
+        shell: pwsh
+        run: |
+          git init
+          git remote add origin https://github.com/${{ github.repository }}.git
+          git fetch --depth 1 origin ${{ github.sha }}
+          git checkout FETCH_HEAD
 
       - name: Install
         run: npm ci
@@ -31,49 +48,45 @@ jobs:
       - name: Rename artifact
         shell: pwsh
         run: |
-          $ref = "${{ github.ref_name }}"
-          $sha = "${{ github.sha }}".Substring(0, 7)
-          $ver = if ($ref -like "v*") { $ref } else { "dev-$sha" }
+          $tag = "${{ github.ref_name }}"
           $src = "X-get2put-exe.zip"
-          $dst = "X-get2put-$ver-win-x64.zip"
+          $dst = "X-get2put-$tag-win-x64.zip"
           if (!(Test-Path $src)) { throw "Missing $src" }
           Move-Item -Force $src $dst
-          Write-Host "Artifact: $dst"
+          Write-Host "Built: $dst"
 
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: windows
-          path: X-get2put-*.zip
+      - name: Upload to Release (gh)
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = "${{ github.ref_name }}"
+          $file = "X-get2put-$tag-win-x64.zip"
+          gh release upload $tag $file --clobber
 
   build-macos:
     runs-on: macos-latest
+    needs: create-release
+    if: startsWith(github.ref, 'refs/tags/v')
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Setup Node
-        uses: actions/setup-node@v4
-        with:
-          node-version: 18
-          cache: npm
+      - name: Checkout (git)
+        shell: bash
+        run: |
+          set -euo pipefail
+          git init
+          git remote add origin https://github.com/${{ github.repository }}.git
+          git fetch --depth 1 origin ${{ github.sha }}
+          git checkout FETCH_HEAD
 
       - name: Install
+        shell: bash
         run: npm ci
 
       - name: Build packages (arm64/x64) + DMG
         shell: bash
         run: |
           set -euo pipefail
-
-          REF_NAME="${{ github.ref_name }}"
-          SHA="${{ github.sha }}"
-          SHORT_SHA="${SHA:0:7}"
-          if [[ "$REF_NAME" == v* ]]; then
-            VERSION="$REF_NAME"
-          else
-            VERSION="dev-$SHORT_SHA"
-          fi
+          VERSION="${GITHUB_REF_NAME}"
 
           mkdir -p dist-mac
 
@@ -111,31 +124,11 @@ EOF
             echo "Built: $DMG"
           done
 
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: macos
-          path: |
-            dist-mac/X-get2put-*.zip
-            dist-mac/X-get2put-*.dmg
-
-  release:
-    needs: [build-windows, build-macos]
-    runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/v')
-    steps:
-      - name: Download artifacts
-        uses: actions/download-artifact@v4
-        with:
-          path: release-artifacts
-
-      - name: List artifacts
-        run: ls -R release-artifacts
-
-      - name: Create GitHub Release (gh)
+      - name: Upload to Release (gh)
+        shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           TAG="${GITHUB_REF_NAME}"
-          gh release create "$TAG" release-artifacts/**/* --generate-notes --verify-tag
+          gh release upload "$TAG" dist-mac/X-get2put-"$TAG"-macos-*.zip dist-mac/X-get2put-"$TAG"-macos-*.dmg --clobber
