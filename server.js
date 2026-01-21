@@ -988,11 +988,17 @@ async function collectCommenterUsernames(page, options = {}) {
 
         const parseHandleFromHref = (href) => {
           if (!href || typeof href !== "string") return "";
-          if (!href.startsWith("/")) return "";
-          if (href.startsWith("/i/")) return "";
-          if (href.includes("/status/")) return "";
+          let pathname = "";
+          try {
+            pathname = new URL(href, location.origin).pathname || "";
+          } catch {
+            pathname = String(href || "");
+          }
+          if (!pathname.startsWith("/")) return "";
+          if (pathname.startsWith("/i/")) return "";
+          if (pathname.includes("/status/")) return "";
 
-          const clean = href.split("?")[0].replace(/\/+$/g, "");
+          const clean = pathname.replace(/\/+$/g, "");
           const parts = clean.split("/").filter(Boolean);
           if (parts.length !== 1) return "";
           const h = parts[0];
@@ -1054,13 +1060,22 @@ async function scanVisibleCommenterUsernames(page, excludeAuthor) {
         "logout",
       ]);
 
-      const parseHandleFromHref = (href) => {
+      const normalizePathname = (href) => {
         if (!href || typeof href !== "string") return "";
-        if (!href.startsWith("/")) return "";
-        if (href.startsWith("/i/")) return "";
-        if (href.includes("/status/")) return "";
+        try {
+          return new URL(href, location.origin).pathname || "";
+        } catch {
+          return String(href || "");
+        }
+      };
 
-        const clean = href.split("?")[0].replace(/\/+$/g, "");
+      const parseHandleFromProfileHref = (href) => {
+        const pathname = normalizePathname(href);
+        if (!pathname.startsWith("/")) return "";
+        if (pathname.startsWith("/i/")) return "";
+        if (pathname.includes("/status/")) return "";
+
+        const clean = pathname.replace(/\/+$/g, "");
         const parts = clean.split("/").filter(Boolean);
         if (parts.length !== 1) return "";
         const h = parts[0];
@@ -1071,19 +1086,40 @@ async function scanVisibleCommenterUsernames(page, excludeAuthor) {
         return h;
       };
 
-      const root = document.querySelector('[data-testid="primaryColumn"]') || document.body;
+      const parseHandleFromStatusHref = (href) => {
+        const pathname = normalizePathname(href);
+        const m = pathname.match(/^\/([^\/?#]+)\/status\/\d+/i);
+        if (!m) return "";
+        const h = String(m[1] || "").trim();
+        if (!h) return "";
+        if (!/^[A-Za-z0-9_]{1,50}$/.test(h)) return "";
+        if (banned.has(h.toLowerCase())) return "";
+        if (excludeAuthor && h.toLowerCase() === String(excludeAuthor).toLowerCase()) return "";
+        return h;
+      };
+
+      const root =
+        document.querySelector('[data-testid="primaryColumn"]') ||
+        document.querySelector('main[role="main"]') ||
+        document.body;
       const out = [];
 
       const articles = Array.from(root.querySelectorAll("article"));
       for (const article of articles) {
-        // 优先取“作者区”的主页链接，避免误抓到正文里的 @ 提及链接
-        const a1 = article.querySelector('[data-testid="User-Name"] a[href]');
-        let h = parseHandleFromHref(a1 ? a1.getAttribute("href") || "" : "");
+        // 优先从“时间戳(time)的 status 链接”里解析作者（最稳，且不会误抓正文 @ 提及）
+        let h = "";
+        try {
+          const timeEl = article.querySelector("time");
+          const statusA = timeEl ? timeEl.closest("a[href]") : null;
+          const href = statusA ? statusA.getAttribute("href") || statusA.href || "" : "";
+          h = parseHandleFromStatusHref(href);
+        } catch {}
 
-        // 兜底：有些 UI 结构可能没有 data-testid="User-Name"
+        // 兜底：再从“作者区”的主页链接解析（避免误抓正文 @ 提及链接）
         if (!h) {
-          const a2 = article.querySelector('a[href^="/"][role="link"]');
-          h = parseHandleFromHref(a2 ? a2.getAttribute("href") || "" : "");
+          const a1 = article.querySelector('[data-testid="User-Name"] a[href]');
+          const href = a1 ? a1.getAttribute("href") || a1.href || "" : "";
+          h = parseHandleFromProfileHref(href);
         }
 
         if (!h) continue;
@@ -1194,18 +1230,39 @@ async function bulkFollowCommentersForAccount(account, tweetUrl, options = {}) {
   };
 
   try {
-    // Puppeteer headful 模式下通常会自带一个 about:blank 页面。
-    // 为了避免出现「3 个标签页（2 个空白）」的困扰，这里复用默认页作为评论页，只额外开一个动作页。
+    // 说明：Puppeteer headful + userDataDir 场景下，Chrome 可能会因为“恢复会话/新标签页/扩展页”等原因
+    // 自动打开多个标签页。为了避免「多开空白页」以及“选错 tab 导致 scanned=0”，这里强制新建一个工作页。
     const initialPages = await browser.pages().catch(() => []);
-    const commentPage = initialPages[0] || (await browser.newPage());
+    const commentPage = await browser.newPage();
     let actionPage = null;
 
-    // 关闭多余的默认页（若存在）
-    for (const p of initialPages.slice(1)) {
+    const closeOtherBlankTabs = async () => {
+      const pages = await browser.pages().catch(() => []);
+      for (const p of pages) {
+        if (p === commentPage) continue;
+        if (actionPage && p === actionPage) continue;
+        const u = safeString(p.url()).trim().toLowerCase();
+        if (!u || u === "about:blank" || u.startsWith("chrome://newtab")) {
+          // eslint-disable-next-line no-await-in-loop
+          await p.close().catch(() => {});
+        }
+      }
+    };
+
+    // 关闭启动时遗留的标签页（保留我们自己的工作页）
+    for (const p of initialPages) {
       await p.close().catch(() => {});
     }
+    await closeOtherBlankTabs();
 
-    await commentPage.goto(tweetUrl, { waitUntil: "domcontentloaded", timeout: 60_000 }).catch(() => {});
+    await commentPage.bringToFront().catch(() => {});
+    try {
+      await commentPage.goto(tweetUrl, { waitUntil: "domcontentloaded", timeout: 60_000 });
+    } catch (e) {
+      throw new Error(`打开推文失败：${safeString(e?.message || e)}`);
+    }
+
+    await closeOtherBlankTabs();
 
     if (isLoginLikeUrl(commentPage.url())) {
       throw new Error("未登录：请先点“打开浏览器登录”完成登录");
@@ -1230,6 +1287,7 @@ async function bulkFollowCommentersForAccount(account, tweetUrl, options = {}) {
     const pending = [];
     let noNewRounds = 0;
     let rounds = 0;
+    let emptyDiagLogged = false;
 
     const enqueueHandles = (items) => {
       let added = 0;
@@ -1255,6 +1313,7 @@ async function bulkFollowCommentersForAccount(account, tweetUrl, options = {}) {
       if (getBulkFollowRemaining(state) <= 0) break;
 
       if (pending.length === 0) {
+        await commentPage.bringToFront().catch(() => {});
         rounds += 1;
         if (rounds > maxRounds) {
           addBulkLog(
@@ -1270,7 +1329,29 @@ async function bulkFollowCommentersForAccount(account, tweetUrl, options = {}) {
 
         const noNewLimit = seen.size === 0 ? 25 : maxNoNewRounds;
 
+        if (!emptyDiagLogged && seen.size === 0 && noNewRounds >= 5) {
+          emptyDiagLogged = true;
+          const diag = await commentPage
+            .evaluate(() => {
+              const url = location.href || "";
+              const articles = document.querySelectorAll("article").length;
+              const hasPrimary = Boolean(document.querySelector('[data-testid="primaryColumn"]'));
+              const hasMain = Boolean(document.querySelector('main[role="main"]'));
+              return { url, articles, hasPrimary, hasMain };
+            })
+            .catch(() => null);
+          if (diag && typeof diag === "object") {
+            addBulkLog(
+              `[关注][DBG] 扫描仍为空：url=${safeString(diag.url)} articles=${Number(diag.articles || 0)} primary=${Boolean(
+                diag.hasPrimary,
+              )} main=${Boolean(diag.hasMain)}`,
+            );
+          }
+        }
+
         // 继续滚动加载更多评论
+        await commentPage.mouse.move(640, 400).catch(() => {});
+        await commentPage.mouse.wheel({ deltaY: randomIntInclusive(650, 980) }).catch(() => {});
         await commentPage
           .evaluate(() => {
             const delta = Math.floor(window.innerHeight * 0.85);
@@ -1281,7 +1362,7 @@ async function bulkFollowCommentersForAccount(account, tweetUrl, options = {}) {
             // 有时滚动容器并不是 window（例如某些布局/嵌套滚动），这里尝试找到可滚动父容器并滚动。
             try {
               const primary = document.querySelector('[data-testid="primaryColumn"]');
-              let el = primary ? primary.parentElement : null;
+              let el = primary || (document.scrollingElement && document.scrollingElement !== document.body ? document.scrollingElement : null);
               for (let i = 0; i < 8 && el; i += 1) {
                 const style = window.getComputedStyle(el);
                 const canScroll = (style.overflowY === "auto" || style.overflowY === "scroll") && el.scrollHeight > el.clientHeight + 20;
@@ -1331,9 +1412,11 @@ async function bulkFollowCommentersForAccount(account, tweetUrl, options = {}) {
 
       if (!actionPage) {
         actionPage = await browser.newPage();
+        await closeOtherBlankTabs();
       }
 
       try {
+        await actionPage.bringToFront().catch(() => {});
         await actionPage.goto(profileUrl, { waitUntil: "domcontentloaded", timeout: 60_000 });
       } catch (e) {
         summary.failed += 1;
