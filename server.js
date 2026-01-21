@@ -1106,16 +1106,31 @@ async function followUserFromProfile(page) {
   const followBtnSel = '[data-testid$="-follow"]';
   const unfollowBtnSel = '[data-testid$="-unfollow"]';
 
+  // 等待按钮渲染（弱网/代理环境下首屏渲染可能较慢）
+  await page.waitForSelector(`${unfollowBtnSel}, ${followBtnSel}`, { timeout: 8000 }).catch(() => {});
+
   const unfollowBtn = await page.$(unfollowBtnSel);
   if (unfollowBtn) return { status: "already_following" };
 
-  const followBtn = await page.$(followBtnSel);
+  let followBtn = await page.$(followBtnSel);
+  if (!followBtn) {
+    // 兼容某些 UI 变体：按钮被包在 placementTracking 里（文本可能是 Follow/Follow back/关注）
+    const alt = await page.$('[data-testid="placementTracking"] [role="button"]');
+    if (alt) {
+      const txt = await alt.evaluate((b) => (b && (b.innerText || b.textContent) ? String(b.innerText || b.textContent) : "")).catch(() => "");
+      if (/\bfollow\b/i.test(txt) || /关注/.test(txt)) {
+        followBtn = alt;
+      }
+    }
+  }
   if (!followBtn) return { status: "button_not_found" };
 
   await followBtn.evaluate((b) => b.scrollIntoView({ block: "center" })).catch(() => {});
   await sleep(200);
   await followBtn.click().catch(() => {});
-  await sleep(900);
+
+  // 等待 UI 变为 Following（unfollow 出现），否则可能是受保护账号/被限制/未刷新
+  await page.waitForSelector(unfollowBtnSel, { timeout: 5000 }).catch(() => {});
 
   const unfollowAfter = await page.$(unfollowBtnSel);
   if (unfollowAfter) return { status: "followed" };
@@ -1168,8 +1183,16 @@ async function bulkFollowCommentersForAccount(account, tweetUrl, options = {}) {
   };
 
   try {
-    const commentPage = await browser.newPage();
+    // Puppeteer headful 模式下通常会自带一个 about:blank 页面。
+    // 为了避免出现「3 个标签页（2 个空白）」的困扰，这里复用默认页作为评论页，只额外开一个动作页。
+    const initialPages = await browser.pages().catch(() => []);
+    const commentPage = initialPages[0] || (await browser.newPage());
     const actionPage = await browser.newPage();
+
+    // 关闭多余的默认页（若存在）
+    for (const p of initialPages.slice(1)) {
+      await p.close().catch(() => {});
+    }
 
     await commentPage.goto(tweetUrl, { waitUntil: "domcontentloaded", timeout: 60_000 }).catch(() => {});
 
@@ -1296,7 +1319,7 @@ async function bulkFollowCommentersForAccount(account, tweetUrl, options = {}) {
         continue;
       }
 
-      if (r.status === "followed" || r.status === "clicked") {
+      if (r.status === "followed") {
         summary.followed += 1;
         if (summary.followed >= effectiveFollowLimit) {
           addBulkLog(`[关注] 已达本次上限 account=${safeString(a.name || a.id)} limit=${effectiveFollowLimit}`);
@@ -1311,6 +1334,17 @@ async function bulkFollowCommentersForAccount(account, tweetUrl, options = {}) {
 
         // eslint-disable-next-line no-await-in-loop
         await sleep(randomIntInclusive(1100, 2400));
+        continue;
+      }
+
+      if (r.status === "clicked") {
+        summary.failed += 1;
+        summary.warnings += 1;
+        addBulkLog(
+          `[关注][WARN] 已点击关注但未验证成功（可能被限制/受保护/界面未刷新），跳过 account=${safeString(a.name || a.id)} user=@${username}`,
+        );
+        // eslint-disable-next-line no-await-in-loop
+        await sleep(randomIntInclusive(900, 1600));
         continue;
       }
 
