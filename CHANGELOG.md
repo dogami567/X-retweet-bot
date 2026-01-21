@@ -1,5 +1,9 @@
 # 更新日志
 
+## v0.3.8 (2026-01-21)
+
+- 修复：Release/EXE 打包后 Puppeteer Stealth 子模块缺失导致无法启动浏览器登录（为 pkg 显式打包 `puppeteer-extra-plugin-stealth/evasions`）。
+
 ## v0.3.7 (2026-01-21)
 
 - 修复：批量页面“打开浏览器登录”会先自动保存配置，避免“新增账号未保存就登录”导致的“账号未找到”。

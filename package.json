@@ -1,6 +1,6 @@
 {
   "name": "x-get2put",
-  "version": "0.3.7",
+  "version": "0.3.8",
   "private": true,
   "description": "TwitterAPI.io 监控与转发系统（本地测试面板 + 轮询监控）",
   "main": "server.js",
@@ -28,6 +28,9 @@
     "pkg": "^5.8.1"
   },
   "pkg": {
+    "scripts": [
+      "node_modules/puppeteer-extra-plugin-stealth/evasions/**/index.js"
+    ],
     "assets": [
       "public/**/*"
     ]
