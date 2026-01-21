@@ -1069,33 +1069,40 @@ async function scanVisibleCommenterUsernames(page, excludeAuthor) {
         }
       };
 
-      const parseHandleFromProfileHref = (href) => {
-        const pathname = normalizePathname(href);
+      const parseTargetFromHref = (href) => {
+        const pathnameRaw = normalizePathname(href);
+        const pathname = String(pathnameRaw || "").replace(/\/+$/g, "");
         if (!pathname.startsWith("/")) return "";
-        if (pathname.startsWith("/i/")) return "";
-        if (pathname.includes("/status/")) return "";
 
-        const clean = pathname.replace(/\/+$/g, "");
-        const parts = clean.split("/").filter(Boolean);
-        if (parts.length !== 1) return "";
-        const h = parts[0];
-        if (!h) return "";
-        if (!/^[A-Za-z0-9_]{1,50}$/.test(h)) return "";
-        if (banned.has(h.toLowerCase())) return "";
-        if (excludeAuthor && h.toLowerCase() === String(excludeAuthor).toLowerCase()) return "";
-        return h;
+        // 兼容：X 有时会用 userId 路由（/i/user/123...），这种情况下直接返回 path 作为目标
+        const mUserId = pathname.match(/^\/i\/user\/\d+/i);
+        if (mUserId) return mUserId[0];
+
+        // 其它情况：只取第一段作为用户名（同时兼容 /{user}/status/{id}、/{user}/likes 等）
+        if (pathname.startsWith("/i/")) return "";
+        const parts = pathname.split("/").filter(Boolean);
+        const first = parts[0] ? String(parts[0]).trim() : "";
+        if (!first) return "";
+        if (!/^[A-Za-z0-9_]{1,50}$/.test(first)) return "";
+        if (banned.has(first.toLowerCase())) return "";
+        if (excludeAuthor && first.toLowerCase() === String(excludeAuthor).toLowerCase()) return "";
+        return first;
       };
 
-      const parseHandleFromStatusHref = (href) => {
-        const pathname = normalizePathname(href);
-        const m = pathname.match(/^\/([^\/?#]+)\/status\/\d+/i);
-        if (!m) return "";
-        const h = String(m[1] || "").trim();
-        if (!h) return "";
-        if (!/^[A-Za-z0-9_]{1,50}$/.test(h)) return "";
-        if (banned.has(h.toLowerCase())) return "";
-        if (excludeAuthor && h.toLowerCase() === String(excludeAuthor).toLowerCase()) return "";
-        return h;
+      const parseHandleFromUserNameText = (article) => {
+        try {
+          const box = article.querySelector('[data-testid="User-Name"]');
+          if (!box) return "";
+          const text = String(box.innerText || box.textContent || "").trim();
+          const m = text.match(/@([A-Za-z0-9_]{1,50})/);
+          const h = m && m[1] ? String(m[1]).trim() : "";
+          if (!h) return "";
+          if (banned.has(h.toLowerCase())) return "";
+          if (excludeAuthor && h.toLowerCase() === String(excludeAuthor).toLowerCase()) return "";
+          return h;
+        } catch {
+          return "";
+        }
       };
 
       const root =
@@ -1107,13 +1114,15 @@ async function scanVisibleCommenterUsernames(page, excludeAuthor) {
       const tweetArticles = Array.from(root.querySelectorAll('article[data-testid="tweet"]'));
       const articles = tweetArticles.length ? tweetArticles : Array.from(root.querySelectorAll("article"));
       for (const article of articles) {
-        // 优先从“时间戳(time)的 status 链接”里解析作者（最稳，且不会误抓正文 @ 提及）
+        // 说明：这里返回“目标”字符串：
+        // - 普通情况：返回用户名（不带 @）
+        // - 特殊情况：返回 /i/user/123... 这样的 path（用来兼容某些布局下不提供 username href 的情况）
         let h = "";
         try {
           const timeEl = article.querySelector("time");
           const statusA = timeEl ? timeEl.closest("a[href]") : null;
           const href = statusA ? statusA.getAttribute("href") || statusA.href || "" : "";
-          h = parseHandleFromStatusHref(href);
+          h = parseTargetFromHref(href);
         } catch {}
 
         // 兜底：从 article 内任意 status 链接解析（兼容某些布局 time 不在 a 内/被异步替换）
@@ -1121,15 +1130,15 @@ async function scanVisibleCommenterUsernames(page, excludeAuthor) {
           try {
             const aStatus = article.querySelector('a[href*="/status/"]');
             const href = aStatus ? aStatus.getAttribute("href") || aStatus.href || "" : "";
-            h = parseHandleFromStatusHref(href);
+            h = parseTargetFromHref(href);
           } catch {}
         }
 
-        // 兜底：再从“作者区”的主页链接解析（避免误抓正文 @ 提及链接）
+        // 兜底：从“作者区”的主页链接解析（避免误抓正文 @ 提及链接）
         if (!h) {
           const a1 = article.querySelector('[data-testid="User-Name"] a[href]');
           const href = a1 ? a1.getAttribute("href") || a1.href || "" : "";
-          h = parseHandleFromProfileHref(href);
+          h = parseTargetFromHref(href);
         }
 
         // 兜底：某些 UI 结构可能没有 data-testid="User-Name"，再从 article 内挑选“非正文(tweetText)区域”的主页链接
@@ -1140,7 +1149,7 @@ async function scanVisibleCommenterUsernames(page, excludeAuthor) {
             for (const a of links) {
               if (a.closest('[data-testid="tweetText"]')) continue;
               const href = a.getAttribute("href") || a.href || "";
-              const hh = parseHandleFromProfileHref(href);
+              const hh = parseTargetFromHref(href);
               if (hh) {
                 h = hh;
                 break;
@@ -1149,7 +1158,17 @@ async function scanVisibleCommenterUsernames(page, excludeAuthor) {
           } catch {}
         }
 
+        // 兜底：如果链接拿不到 username，但能从“User-Name 区域文本”拿到 @username，也用它
+        if (!h) {
+          h = parseHandleFromUserNameText(article);
+        }
+
         if (!h) continue;
+
+        // 避免把主推作者的 /i/user/xxxx 也扫进来：如果能从文本拿到 @，用它再做一次 exclude 判断
+        const textHandle = parseHandleFromUserNameText(article);
+        if (textHandle && excludeAuthor && textHandle.toLowerCase() === String(excludeAuthor).toLowerCase()) continue;
+
         out.push(h);
       }
 
@@ -1419,7 +1438,14 @@ async function bulkFollowCommentersForAccount(account, tweetUrl, options = {}) {
         if (added > 0) {
           const sample = pending
             .slice(0, 3)
-            .map((u) => `@${safeString(u)}`)
+            .map((u) => {
+              const s = safeString(u).trim();
+              if (!s) return "";
+              if (/^https?:\/\//i.test(s)) return s;
+              if (s.startsWith("/")) return s;
+              return `@${s.replace(/^@/, "")}`;
+            })
+            .filter(Boolean)
             .join(",");
           addBulkLog(
             `[关注][DBG] 扫描新增 added=${added} queued=${pending.length} total=${seen.size}${sample ? ` sample=${sample}` : ""}`,
@@ -1548,10 +1574,13 @@ async function bulkFollowCommentersForAccount(account, tweetUrl, options = {}) {
         if (pending.length === 0) continue;
       }
 
-      const username = safeString(pending.shift()).trim();
-      if (!username) continue;
+      const target = safeString(pending.shift()).trim();
+      if (!target) continue;
 
-      const profileUrl = `https://x.com/${username}`;
+      const isPathTarget = target.startsWith("/");
+      const isUrlTarget = /^https?:\/\//i.test(target);
+      const profileUrl = isUrlTarget ? target : isPathTarget ? `https://x.com${target}` : `https://x.com/${target.replace(/^@/, "")}`;
+      const display = isUrlTarget ? target : isPathTarget ? target : `@${target.replace(/^@/, "")}`;
 
       if (!actionPage) {
         actionPage = await browser.newPage();
@@ -1559,24 +1588,42 @@ async function bulkFollowCommentersForAccount(account, tweetUrl, options = {}) {
       }
 
       try {
-        addBulkLog(`[关注] 进入主页 account=${safeString(a.name || a.id)} user=@${username}`);
+        addBulkLog(`[关注] 进入主页 account=${safeString(a.name || a.id)} user=${display}`);
         await actionPage.bringToFront().catch(() => {});
         await actionPage.goto(profileUrl, { waitUntil: "domcontentloaded", timeout: 60_000 });
       } catch (e) {
         summary.failed += 1;
-        addBulkLog(`[关注] 进入主页失败 account=${safeString(a.name || a.id)} user=@${username} error=${safeString(e?.message || e)}`);
+        addBulkLog(`[关注] 进入主页失败 account=${safeString(a.name || a.id)} user=${display} error=${safeString(e?.message || e)}`);
         await sleep(randomIntInclusive(900, 1600));
         continue;
       }
 
       // 导航兜底：如果最终 URL 并不是目标用户主页，就不要继续点击（避免误操作）。
       {
-        const currentUrl = safeString(actionPage.url()).toLowerCase();
-        const u = username.toLowerCase();
-        if (!currentUrl.includes(`x.com/${u}`) && !currentUrl.includes(`twitter.com/${u}`)) {
+        const currentUrl = safeString(actionPage.url());
+        let okNav = true;
+        try {
+          const currentPath = new URL(currentUrl).pathname.toLowerCase();
+          if (isPathTarget) {
+            const expectedPath = target.toLowerCase();
+            okNav = currentPath.startsWith(expectedPath);
+          } else if (isUrlTarget) {
+            const expectedPath = new URL(profileUrl).pathname.toLowerCase();
+            okNav = currentPath.startsWith(expectedPath);
+          } else {
+            const u = target.replace(/^@/, "").toLowerCase();
+            okNav = currentPath.startsWith(`/${u}`);
+          }
+        } catch {
+          const cur = safeString(currentUrl).toLowerCase();
+          const expected = safeString(profileUrl).toLowerCase();
+          okNav = cur.includes(expected);
+        }
+
+        if (!okNav) {
           summary.skipped += 1;
           summary.warnings += 1;
-          addBulkLog(`[关注][WARN] 导航后 URL 非目标主页，跳过 account=${safeString(a.name || a.id)} user=@${username} url=${currentUrl}`);
+          addBulkLog(`[关注][WARN] 导航后 URL 非目标主页，跳过 account=${safeString(a.name || a.id)} user=${display} url=${safeString(currentUrl).toLowerCase()}`);
           await sleep(randomIntInclusive(900, 1600));
           continue;
         }
@@ -1592,7 +1639,7 @@ async function bulkFollowCommentersForAccount(account, tweetUrl, options = {}) {
       if (protectedProfile) {
         summary.skipped += 1;
         summary.warnings += 1;
-        addBulkLog(`[关注][WARN] 受保护账号，跳过 account=${safeString(a.name || a.id)} user=@${username}`);
+        addBulkLog(`[关注][WARN] 受保护账号，跳过 account=${safeString(a.name || a.id)} user=${display}`);
         continue;
       }
 
@@ -1602,14 +1649,14 @@ async function bulkFollowCommentersForAccount(account, tweetUrl, options = {}) {
       if (r.status === "already_following") {
         summary.skipped += 1;
         summary.warnings += 1;
-        addBulkLog(`[关注][WARN] 已关注过，跳过 account=${safeString(a.name || a.id)} user=@${username}`);
+        addBulkLog(`[关注][WARN] 已关注过，跳过 account=${safeString(a.name || a.id)} user=${display}`);
         continue;
       }
 
       if (r.status === "button_not_found") {
         summary.skipped += 1;
         summary.warnings += 1;
-        addBulkLog(`[关注][WARN] 未找到关注按钮，跳过 account=${safeString(a.name || a.id)} user=@${username}`);
+        addBulkLog(`[关注][WARN] 未找到关注按钮，跳过 account=${safeString(a.name || a.id)} user=${display}`);
         continue;
       }
 
@@ -1623,7 +1670,7 @@ async function bulkFollowCommentersForAccount(account, tweetUrl, options = {}) {
         state.followDailyCount = Math.max(0, Math.round(Number(state.followDailyCount) || 0)) + 1;
         const remainHint = Math.max(0, effectiveFollowLimit - summary.followed);
         addBulkLog(
-          `[关注] 已关注 account=${safeString(a.name || a.id)} user=@${username} remain=${remainHint}/${effectiveFollowLimit} today=${state.followDailyCount}/${BULK_FOLLOW_COMMENTERS_DAILY_LIMIT}`,
+          `[关注] 已关注 account=${safeString(a.name || a.id)} user=${display} remain=${remainHint}/${effectiveFollowLimit} today=${state.followDailyCount}/${BULK_FOLLOW_COMMENTERS_DAILY_LIMIT}`,
         );
 
         // eslint-disable-next-line no-await-in-loop
@@ -1635,7 +1682,7 @@ async function bulkFollowCommentersForAccount(account, tweetUrl, options = {}) {
         summary.failed += 1;
         summary.warnings += 1;
         addBulkLog(
-          `[关注][WARN] 已点击关注但未验证成功（可能被限制/受保护/界面未刷新），跳过 account=${safeString(a.name || a.id)} user=@${username}`,
+          `[关注][WARN] 已点击关注但未验证成功（可能被限制/受保护/界面未刷新），跳过 account=${safeString(a.name || a.id)} user=${display}`,
         );
         // eslint-disable-next-line no-await-in-loop
         await sleep(randomIntInclusive(900, 1600));
@@ -1643,7 +1690,7 @@ async function bulkFollowCommentersForAccount(account, tweetUrl, options = {}) {
       }
 
       summary.failed += 1;
-      addBulkLog(`[关注] 失败 account=${safeString(a.name || a.id)} user=@${username} error=${safeString(r.error || r.status)}`);
+      addBulkLog(`[关注] 失败 account=${safeString(a.name || a.id)} user=${display} error=${safeString(r.error || r.status)}`);
       // eslint-disable-next-line no-await-in-loop
       await sleep(randomIntInclusive(900, 1600));
     }
