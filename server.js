@@ -1072,13 +1072,24 @@ async function scanVisibleCommenterUsernames(page, excludeAuthor) {
       };
 
       const root = document.querySelector('[data-testid="primaryColumn"]') || document.body;
-      const anchors = Array.from(root.querySelectorAll('article [data-testid="User-Name"] a[href]'));
       const out = [];
-      for (const a of anchors) {
-        const h = parseHandleFromHref(a.getAttribute("href") || "");
+
+      const articles = Array.from(root.querySelectorAll("article"));
+      for (const article of articles) {
+        // 优先取“作者区”的主页链接，避免误抓到正文里的 @ 提及链接
+        const a1 = article.querySelector('[data-testid="User-Name"] a[href]');
+        let h = parseHandleFromHref(a1 ? a1.getAttribute("href") || "" : "");
+
+        // 兜底：有些 UI 结构可能没有 data-testid="User-Name"
+        if (!h) {
+          const a2 = article.querySelector('a[href^="/"][role="link"]');
+          h = parseHandleFromHref(a2 ? a2.getAttribute("href") || "" : "");
+        }
+
         if (!h) continue;
         out.push(h);
       }
+
       return Array.from(new Set(out));
     }, authorToExclude)
     .catch(() => []);
@@ -1187,7 +1198,7 @@ async function bulkFollowCommentersForAccount(account, tweetUrl, options = {}) {
     // 为了避免出现「3 个标签页（2 个空白）」的困扰，这里复用默认页作为评论页，只额外开一个动作页。
     const initialPages = await browser.pages().catch(() => []);
     const commentPage = initialPages[0] || (await browser.newPage());
-    const actionPage = await browser.newPage();
+    let actionPage = null;
 
     // 关闭多余的默认页（若存在）
     for (const p of initialPages.slice(1)) {
@@ -1202,6 +1213,8 @@ async function bulkFollowCommentersForAccount(account, tweetUrl, options = {}) {
 
     await commentPage.waitForSelector("article", { timeout: 15_000 }).catch(() => {});
     await sleep(900);
+    // 给评论/回复一点加载时间（否则很容易只看到主推文作者，exclude 后会变成 0）
+    await commentPage.waitForFunction(() => document.querySelectorAll("article").length > 1, { timeout: 6000 }).catch(() => {});
 
     const remainDaily = Math.max(0, Math.round(Number(options.remainDaily || 0)));
     const maxFollow = Math.max(1, Math.round(Number(options.maxFollow || 0) || 1));
@@ -1255,12 +1268,52 @@ async function bulkFollowCommentersForAccount(account, tweetUrl, options = {}) {
         if (added === 0) noNewRounds += 1;
         else noNewRounds = 0;
 
+        const noNewLimit = seen.size === 0 ? 25 : maxNoNewRounds;
+
         // 继续滚动加载更多评论
-        await commentPage.evaluate(() => window.scrollBy(0, Math.floor(window.innerHeight * 0.85))).catch(() => {});
+        await commentPage
+          .evaluate(() => {
+            const delta = Math.floor(window.innerHeight * 0.85);
+            try {
+              window.scrollBy(0, delta);
+            } catch {}
+
+            // 有时滚动容器并不是 window（例如某些布局/嵌套滚动），这里尝试找到可滚动父容器并滚动。
+            try {
+              const primary = document.querySelector('[data-testid="primaryColumn"]');
+              let el = primary ? primary.parentElement : null;
+              for (let i = 0; i < 8 && el; i += 1) {
+                const style = window.getComputedStyle(el);
+                const canScroll = (style.overflowY === "auto" || style.overflowY === "scroll") && el.scrollHeight > el.clientHeight + 20;
+                if (canScroll) {
+                  el.scrollBy(0, delta);
+                  break;
+                }
+                el = el.parentElement;
+              }
+            } catch {}
+
+            // 有些推文需要点“显示更多回复/Show more replies”才会展开，做一次轻量兜底点击（找不到就算了）。
+            try {
+              const root = document.querySelector('[data-testid="primaryColumn"]') || document.body;
+              const btns = Array.from(root.querySelectorAll('[role="button"]'));
+              const patterns = ["show more replies", "show replies", "显示更多回复", "查看更多回复", "展开更多回复"];
+              for (const b of btns) {
+                const text = (b.innerText || b.textContent || "").trim();
+                if (!text) continue;
+                const t = text.toLowerCase();
+                if (patterns.some((p) => t.includes(p.toLowerCase()))) {
+                  b.click();
+                  break;
+                }
+              }
+            } catch {}
+          })
+          .catch(() => {});
         await sleep(randomIntInclusive(700, 1400));
 
         // 评论区已没有新用户了：提前结束
-        if (pending.length === 0 && (noNewRounds >= maxNoNewRounds || seen.size >= maxScanUsers)) {
+        if (pending.length === 0 && (noNewRounds >= noNewLimit || seen.size >= maxScanUsers)) {
           addBulkLog(
             `[关注] 评论用户已耗尽/无新增，提前结束 account=${safeString(a.name || a.id)} followed=${summary.followed}/${effectiveFollowLimit} scanned=${seen.size}`,
           );
@@ -1276,8 +1329,9 @@ async function bulkFollowCommentersForAccount(account, tweetUrl, options = {}) {
 
       const profileUrl = `https://x.com/${username}`;
 
-      // 避免导航失败时误操作上一个用户：先清空页面，再跳转
-      await actionPage.goto("about:blank").catch(() => {});
+      if (!actionPage) {
+        actionPage = await browser.newPage();
+      }
 
       try {
         await actionPage.goto(profileUrl, { waitUntil: "domcontentloaded", timeout: 60_000 });
@@ -1286,6 +1340,19 @@ async function bulkFollowCommentersForAccount(account, tweetUrl, options = {}) {
         addBulkLog(`[关注] 进入主页失败 account=${safeString(a.name || a.id)} user=@${username} error=${safeString(e?.message || e)}`);
         await sleep(randomIntInclusive(900, 1600));
         continue;
+      }
+
+      // 导航兜底：如果最终 URL 并不是目标用户主页，就不要继续点击（避免误操作）。
+      {
+        const currentUrl = safeString(actionPage.url()).toLowerCase();
+        const u = username.toLowerCase();
+        if (!currentUrl.includes(`x.com/${u}`) && !currentUrl.includes(`twitter.com/${u}`)) {
+          summary.skipped += 1;
+          summary.warnings += 1;
+          addBulkLog(`[关注][WARN] 导航后 URL 非目标主页，跳过 account=${safeString(a.name || a.id)} user=@${username} url=${currentUrl}`);
+          await sleep(randomIntInclusive(900, 1600));
+          continue;
+        }
       }
 
       await sleep(randomIntInclusive(800, 1400));
