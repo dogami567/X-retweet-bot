@@ -101,6 +101,7 @@ async function loadConfig() {
   byId("xApiSecret").value = config?.forward?.x?.apiSecret || "";
   byId("xAccessToken").value = config?.forward?.x?.accessToken || "";
   byId("xAccessSecret").value = config?.forward?.x?.accessSecret || "";
+  byId("xProfileDir").value = config?.forward?.x?.profileDir || "";
   byId("forwardProxy").value = config?.forward?.proxy || "";
 }
 
@@ -128,6 +129,7 @@ async function saveConfig() {
         apiSecret: byId("xApiSecret").value.trim(),
         accessToken: byId("xAccessToken").value.trim(),
         accessSecret: byId("xAccessSecret").value.trim(),
+        profileDir: byId("xProfileDir").value.trim(),
       },
     },
   };
@@ -175,6 +177,30 @@ async function testXAuth() {
   setJsonBox(res);
   const tab = bootstrap.Tab.getOrCreateInstance(document.querySelector('a[href="#tabApi"]'));
   tab.show();
+}
+
+async function openLogin() {
+  const btn = byId("btnOpenLogin");
+  const originalText = btn.innerHTML;
+  btn.disabled = true;
+  btn.innerHTML = `<span class="spinner-border spinner-border-sm" role="status" aria-hidden="true"></span> 等待登录...`;
+
+  try {
+    setJsonBox({
+      msg: "正在启动浏览器...\n1. 请在弹出的窗口完成登录（可选 Continue with Google）。\n2. 登录成功后保持在首页，窗口会自动关闭。\n\n提示：不建议在脚本里保存账号密码。",
+    });
+    const res = await api("/api/open-login", { method: "POST", body: JSON.stringify({}) });
+    if (res.ok) {
+      await loadConfig();
+      setJsonBox(res);
+    }
+  } catch (e) {
+    setJsonBox({ error: String(e.message || e) });
+    alert("打开登录失败: " + String(e.message || e));
+  } finally {
+    btn.disabled = false;
+    btn.innerHTML = originalText;
+  }
 }
 
 async function startMonitor() {
@@ -250,6 +276,7 @@ bind("btnTestPost", "click", testPost);
 bind("btnTestRetweet", "click", testRetweet);
 bind("btnTestRepost", "click", testRepost);
 bind("btnTestXAuth", "click", testXAuth);
+bind("btnOpenLogin", "click", openLogin);
 bind("btnStartMonitor", "click", startMonitor);
 bind("btnStopMonitor", "click", stopMonitor);
 bind("btnRunOnce", "click", runOnce);

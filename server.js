@@ -774,6 +774,131 @@ async function bulkPostViaPuppeteer(account, text, filePaths) {
   }
 }
 
+async function xAuthViaPuppeteer(account) {
+  const exe = findLocalBrowser();
+  if (!exe) throw new Error("浏览器验证需要本地 Chrome/Edge。");
+
+  const profileDirValue = safeString(account?.x?.profileDir).trim();
+  if (!profileDirValue) throw new Error("未绑定浏览器 Profile：请先点“打开浏览器登录”完成登录");
+  const profileDir = resolveAppDirPath(profileDirValue);
+  if (!profileDir) throw new Error("Profile 目录解析失败");
+
+  await fs.mkdir(profileDir, { recursive: true });
+
+  const proxyUrl = getBulkProxyUrl(account);
+  const launchArgs = [
+    "--disable-blink-features=AutomationControlled",
+    "--no-first-run",
+    "--no-default-browser-check",
+    "--disable-infobars",
+    "--window-position=0,0",
+    "--window-size=1280,800",
+  ];
+  if (proxyUrl) launchArgs.push(`--proxy-server=${proxyUrl}`);
+
+  const browser = await puppeteer.launch({
+    executablePath: exe,
+    headless: false,
+    defaultViewport: null,
+    userDataDir: profileDir,
+    ignoreDefaultArgs: ["--enable-automation"],
+    args: launchArgs,
+  });
+
+  try {
+    const page = await browser.newPage();
+    await page.goto("https://x.com/home", { waitUntil: "networkidle2", timeout: 60_000 }).catch(() => {});
+
+    if (isLoginLikeUrl(page.url())) {
+      throw new Error("未登录：请先点“打开浏览器登录”完成登录");
+    }
+
+    const loggedIn = await page
+      .evaluate(() => {
+        return Boolean(
+          document.querySelector('[data-testid="SideNav_AccountSwitcher_Button"]') ||
+            document.querySelector('[data-testid="SideNav_NewTweet_Button"]'),
+        );
+      })
+      .catch(() => false);
+
+    if (!loggedIn) throw new Error("未检测到登录态：请确认已登录后重试");
+
+    return { ok: true, profileDir: profileDirValue, proxy: redactUrlCredentials(proxyUrl) };
+  } finally {
+    await browser.close();
+  }
+}
+
+async function xRetweetViaPuppeteer(account, tweetId) {
+  const id = safeString(tweetId).trim();
+  if (!id) throw new Error("tweetId 为空");
+
+  const exe = findLocalBrowser();
+  if (!exe) throw new Error("浏览器转推需要本地 Chrome/Edge。");
+
+  const profileDirValue = safeString(account?.x?.profileDir).trim();
+  if (!profileDirValue) throw new Error("未绑定浏览器 Profile：请先点“打开浏览器登录”完成登录");
+  const profileDir = resolveAppDirPath(profileDirValue);
+  if (!profileDir) throw new Error("Profile 目录解析失败");
+
+  await fs.mkdir(profileDir, { recursive: true });
+
+  const proxyUrl = getBulkProxyUrl(account);
+  const launchArgs = [
+    "--disable-blink-features=AutomationControlled",
+    "--no-first-run",
+    "--no-default-browser-check",
+    "--disable-infobars",
+    "--window-position=0,0",
+    "--window-size=1280,800",
+  ];
+  if (proxyUrl) launchArgs.push(`--proxy-server=${proxyUrl}`);
+
+  const browser = await puppeteer.launch({
+    executablePath: exe,
+    headless: false,
+    defaultViewport: null,
+    userDataDir: profileDir,
+    ignoreDefaultArgs: ["--enable-automation"],
+    args: launchArgs,
+  });
+
+  try {
+    const page = await browser.newPage();
+    await page.goto(`https://x.com/i/web/status/${encodeURIComponent(id)}`, { waitUntil: "networkidle2", timeout: 60_000 }).catch(() => {});
+
+    if (isLoginLikeUrl(page.url())) {
+      throw new Error("未登录：请先点“打开浏览器登录”完成登录");
+    }
+
+    await page.waitForSelector("article", { timeout: 15_000 }).catch(() => {});
+    await sleep(900);
+
+    const unretweetBtn = await page.$('[data-testid="unretweet"]').catch(() => null);
+    if (unretweetBtn) return { ok: true, tweetId: id, status: "already_retweeted" };
+
+    const rtBtn = await page.$('[data-testid="retweet"]').catch(() => null);
+    if (!rtBtn) throw new Error("未找到 retweet 按钮");
+
+    await rtBtn.evaluate((b) => b.scrollIntoView({ block: "center" })).catch(() => {});
+    await sleep(200);
+    await rtBtn.click().catch(() => {});
+    await sleep(500);
+
+    const confirmSel = '[data-testid="retweetConfirm"]';
+    await page.waitForSelector(confirmSel, { timeout: 8000 }).catch(() => {});
+    const confirm = await page.$(confirmSel).catch(() => null);
+    if (!confirm) throw new Error("未找到 Repost 确认按钮");
+    await confirm.click().catch(() => {});
+    await sleep(1200);
+
+    return { ok: true, tweetId: id, status: "retweeted", proxy: redactUrlCredentials(proxyUrl) };
+  } finally {
+    await browser.close();
+  }
+}
+
 function normalizeXStatusUrl(rawUrl) {
   const raw = safeString(rawUrl).trim();
   if (!raw) return "";
@@ -912,6 +1037,55 @@ async function collectCommenterUsernames(page, options = {}) {
   return Array.from(seen);
 }
 
+async function scanVisibleCommenterUsernames(page, excludeAuthor) {
+  const authorToExclude = safeString(excludeAuthor).trim();
+  const handles = await page
+    .evaluate((excludeAuthor) => {
+      const banned = new Set([
+        "home",
+        "explore",
+        "search",
+        "i",
+        "settings",
+        "compose",
+        "notifications",
+        "messages",
+        "login",
+        "logout",
+      ]);
+
+      const parseHandleFromHref = (href) => {
+        if (!href || typeof href !== "string") return "";
+        if (!href.startsWith("/")) return "";
+        if (href.startsWith("/i/")) return "";
+        if (href.includes("/status/")) return "";
+
+        const clean = href.split("?")[0].replace(/\/+$/g, "");
+        const parts = clean.split("/").filter(Boolean);
+        if (parts.length !== 1) return "";
+        const h = parts[0];
+        if (!h) return "";
+        if (!/^[A-Za-z0-9_]{1,50}$/.test(h)) return "";
+        if (banned.has(h.toLowerCase())) return "";
+        if (excludeAuthor && h.toLowerCase() === String(excludeAuthor).toLowerCase()) return "";
+        return h;
+      };
+
+      const root = document.querySelector('[data-testid="primaryColumn"]') || document.body;
+      const anchors = Array.from(root.querySelectorAll('article [data-testid="User-Name"] a[href]'));
+      const out = [];
+      for (const a of anchors) {
+        const h = parseHandleFromHref(a.getAttribute("href") || "");
+        if (!h) continue;
+        out.push(h);
+      }
+      return Array.from(new Set(out));
+    }, authorToExclude)
+    .catch(() => []);
+
+  return Array.isArray(handles) ? handles.map((h) => safeString(h).trim()).filter(Boolean) : [];
+}
+
 async function isProtectedProfilePage(page) {
   const text = await page
     .evaluate(() => (document.body ? document.body.innerText || "" : ""))
@@ -994,32 +1168,49 @@ async function bulkFollowCommentersForAccount(account, tweetUrl, options = {}) {
   };
 
   try {
-    const page = await browser.newPage();
-    await page.goto(tweetUrl, { waitUntil: "networkidle2", timeout: 60_000 });
+    const commentPage = await browser.newPage();
+    const actionPage = await browser.newPage();
 
-    if (isLoginLikeUrl(page.url())) {
+    await commentPage.goto(tweetUrl, { waitUntil: "domcontentloaded", timeout: 60_000 }).catch(() => {});
+
+    if (isLoginLikeUrl(commentPage.url())) {
       throw new Error("未登录：请先点“打开浏览器登录”完成登录");
     }
 
-    await page.waitForSelector("article", { timeout: 15_000 }).catch(() => {});
+    await commentPage.waitForSelector("article", { timeout: 15_000 }).catch(() => {});
     await sleep(900);
 
     const remainDaily = Math.max(0, Math.round(Number(options.remainDaily || 0)));
     const maxFollow = Math.max(1, Math.round(Number(options.maxFollow || 0) || 1));
     const effectiveFollowLimit = Math.max(1, Math.min(remainDaily || maxFollow, maxFollow));
-    const maxToCollect = Math.min(5000, Math.max(300, effectiveFollowLimit * 3));
     const authorFromUrl = extractStatusAuthorFromUrl(tweetUrl);
 
-    const handles = await collectCommenterUsernames(page, {
-      maxUsers: maxToCollect,
-      excludeAuthor: authorFromUrl,
-      maxNoNewRounds: 8,
-      maxRounds: 260,
-    });
+    // 逐步扫描评论用户 + 逐个进入关注：避免先把大量评论用户全部收集完（大帖会很慢）
+    const maxRounds = 260;
+    const maxNoNewRounds = 8;
+    const maxScanUsers = Math.min(5000, Math.max(150, effectiveFollowLimit * 12));
 
-    summary.collected = handles.length;
+    const seen = new Set();
+    const pending = [];
+    let noNewRounds = 0;
+    let rounds = 0;
 
-    for (const h of handles) {
+    const enqueueHandles = (items) => {
+      let added = 0;
+      for (const h of Array.isArray(items) ? items : []) {
+        const s = safeString(h).trim();
+        if (!s) continue;
+        if (seen.has(s)) continue;
+        if (seen.size >= maxScanUsers) break;
+        seen.add(s);
+        pending.push(s);
+        added += 1;
+      }
+      summary.collected = seen.size;
+      return added;
+    };
+
+    while (true) {
       if (isBulkFollowStopRequested()) break;
       if (summary.followed >= effectiveFollowLimit) break;
 
@@ -1027,22 +1218,60 @@ async function bulkFollowCommentersForAccount(account, tweetUrl, options = {}) {
       ensureBulkFollowDailyState(state);
       if (getBulkFollowRemaining(state) <= 0) break;
 
-      const username = safeString(h).trim();
+      if (pending.length === 0) {
+        rounds += 1;
+        if (rounds > maxRounds) {
+          addBulkLog(
+            `[关注] 扫描轮次已达上限，提前结束 account=${safeString(a.name || a.id)} followed=${summary.followed}/${effectiveFollowLimit} scanned=${seen.size}`,
+          );
+          break;
+        }
+
+        const found = await scanVisibleCommenterUsernames(commentPage, authorFromUrl);
+        const added = enqueueHandles(found);
+        if (added === 0) noNewRounds += 1;
+        else noNewRounds = 0;
+
+        // 继续滚动加载更多评论
+        await commentPage.evaluate(() => window.scrollBy(0, Math.floor(window.innerHeight * 0.85))).catch(() => {});
+        await sleep(randomIntInclusive(700, 1400));
+
+        // 评论区已没有新用户了：提前结束
+        if (pending.length === 0 && (noNewRounds >= maxNoNewRounds || seen.size >= maxScanUsers)) {
+          addBulkLog(
+            `[关注] 评论用户已耗尽/无新增，提前结束 account=${safeString(a.name || a.id)} followed=${summary.followed}/${effectiveFollowLimit} scanned=${seen.size}`,
+          );
+          break;
+        }
+
+        // 本轮没拿到用户，继续下一轮扫描
+        if (pending.length === 0) continue;
+      }
+
+      const username = safeString(pending.shift()).trim();
       if (!username) continue;
 
       const profileUrl = `https://x.com/${username}`;
-      // eslint-disable-next-line no-await-in-loop
-      await page.goto(profileUrl, { waitUntil: "networkidle2", timeout: 60_000 }).catch(() => {});
 
-      // eslint-disable-next-line no-await-in-loop
+      // 避免导航失败时误操作上一个用户：先清空页面，再跳转
+      await actionPage.goto("about:blank").catch(() => {});
+
+      try {
+        await actionPage.goto(profileUrl, { waitUntil: "domcontentloaded", timeout: 60_000 });
+      } catch (e) {
+        summary.failed += 1;
+        addBulkLog(`[关注] 进入主页失败 account=${safeString(a.name || a.id)} user=@${username} error=${safeString(e?.message || e)}`);
+        await sleep(randomIntInclusive(900, 1600));
+        continue;
+      }
+
       await sleep(randomIntInclusive(800, 1400));
 
-      if (isLoginLikeUrl(page.url())) {
+      if (isLoginLikeUrl(actionPage.url())) {
         throw new Error("未登录：请先点“打开浏览器登录”完成登录");
       }
 
-      // eslint-disable-next-line no-await-in-loop
-      const protectedProfile = await isProtectedProfilePage(page).catch(() => false);
+      const protectedProfile = await isProtectedProfilePage(actionPage).catch(() => false);
       if (protectedProfile) {
         summary.skipped += 1;
         summary.warnings += 1;
@@ -1051,7 +1280,7 @@ async function bulkFollowCommentersForAccount(account, tweetUrl, options = {}) {
       }
 
       // eslint-disable-next-line no-await-in-loop
-      const r = await followUserFromProfile(page).catch((e) => ({ status: "error", error: safeString(e?.message || e) }));
+      const r = await followUserFromProfile(actionPage).catch((e) => ({ status: "error", error: safeString(e?.message || e) }));
 
       if (r.status === "already_following") {
         summary.skipped += 1;
@@ -1075,7 +1304,10 @@ async function bulkFollowCommentersForAccount(account, tweetUrl, options = {}) {
         const state = upsertBulkState(a.id);
         ensureBulkFollowDailyState(state);
         state.followDailyCount = Math.max(0, Math.round(Number(state.followDailyCount) || 0)) + 1;
-        addBulkLog(`[关注] 已关注 account=${safeString(a.name || a.id)} user=@${username} today=${state.followDailyCount}/${BULK_FOLLOW_COMMENTERS_DAILY_LIMIT}`);
+        const remainHint = Math.max(0, effectiveFollowLimit - summary.followed);
+        addBulkLog(
+          `[关注] 已关注 account=${safeString(a.name || a.id)} user=@${username} remain=${remainHint}/${effectiveFollowLimit} today=${state.followDailyCount}/${BULK_FOLLOW_COMMENTERS_DAILY_LIMIT}`,
+        );
 
         // eslint-disable-next-line no-await-in-loop
         await sleep(randomIntInclusive(1100, 2400));
@@ -2574,19 +2806,17 @@ async function processQueue() {
   const sendIntervalSecRaw = Number(forward.sendIntervalSec ?? 5);
   const sendIntervalMs = Number.isFinite(sendIntervalSecRaw) ? Math.max(0, Math.round(sendIntervalSecRaw * 1000)) : 5000;
 
-  if (enabled && !dryRun && xRateLimitUntilMs > now) {
-    const remaining = Math.max(1, Math.ceil((xRateLimitUntilMs - now) / 1000));
-    if (now - xRateLimitLastLogMs > 15_000) {
-      addLog(`[队列] X 命中限流，暂停处理 ${remaining}s`);
-      xRateLimitLastLogMs = now;
-    }
-    return;
-  }
+  const forwardProfileDir = safeString(config?.forward?.x?.profileDir).trim();
+  const hasForwardBrowserProfile = Boolean(forwardProfileDir);
+  const forwardBrowserAccount = hasForwardBrowserProfile
+    ? { id: "forward", name: "forward", proxy: getXProxyUrl(config), x: { profileDir: forwardProfileDir } }
+    : null;
 
   let xClient = null;
   let xLoggedUserId = "";
   let xInitError = "";
   let xProxyForLog = "";
+  let useBrowserMode = false;
 
   if (enabled && !dryRun) {
     try {
@@ -2594,8 +2824,21 @@ async function processQueue() {
       xClient = created.client;
       xProxyForLog = redactUrlCredentials(created.proxyUrl);
     } catch (e) {
-      xInitError = safeString(e?.message || e);
+      if (hasForwardBrowserProfile) {
+        useBrowserMode = true;
+      } else {
+        xInitError = safeString(e?.message || e);
+      }
     }
+  }
+
+  if (enabled && !dryRun && !useBrowserMode && xClient && xRateLimitUntilMs > now) {
+    const remaining = Math.max(1, Math.ceil((xRateLimitUntilMs - now) / 1000));
+    if (now - xRateLimitLastLogMs > 15_000) {
+      addLog(`[队列] X 命中限流，暂停处理 ${remaining}s`);
+      xRateLimitLastLogMs = now;
+    }
+    return;
   }
 
   let loggedInitError = false;
@@ -2640,7 +2883,7 @@ async function processQueue() {
       continue;
     }
 
-    if (xInitError || !xClient) {
+    if (!useBrowserMode && (xInitError || !xClient)) {
       if (!loggedInitError) {
         const proxyHint = xProxyForLog ? ` proxy=${xProxyForLog}` : "";
         addLog(`[队列] X API 未就绪，无法转发：${xInitError || "未知原因"}${proxyHint}`);
@@ -2663,6 +2906,33 @@ async function processQueue() {
           requireSourceTweet: true,
           strictPhotos: true,
         });
+        if (useBrowserMode) {
+          const filePaths = (prepared.media || [])
+            .map((m) => path.join(prepared.downloadDir || "", safeString(m?.fileName).trim()))
+            .filter((p) => safeString(p).trim());
+
+          let newTweetId = "";
+          try {
+            stats.xCalls += 1;
+            newTweetId = await bulkPostViaPuppeteer(
+              forwardBrowserAccount,
+              truncateTweetText(prepared.text || "", 280),
+              filePaths,
+            );
+          } catch (e) {
+            throw new Error(`发帖失败[Puppeteer]: ${safeString(e?.message || e)}`);
+          }
+
+          const savedHint = prepared.downloadDir ? ` saved=${prepared.downloadDir}` : "";
+          const newIdHint = newTweetId ? ` -> new_tweet_id=${newTweetId}` : "";
+          addLog(`[转发成功] create_tweet(browser) tweet_id=${tweetId}${newIdHint}${savedHint}`);
+          pushForwarded(target, tweetId);
+          db.queue.splice(i, 1);
+          i -= 1;
+          if (shouldWait) await sleep(sendIntervalMs);
+          continue;
+        }
+
         const mediaIds = await uploadMediaToX(xClient, prepared.media);
 
         const payload = {
@@ -2685,6 +2955,18 @@ async function processQueue() {
           continue;
         }
         throw new Error("create_tweet 失败：未返回 tweet id");
+      }
+
+      if (useBrowserMode) {
+        const shouldWait = sendIntervalMs > 0 && db.queue.length > 1;
+        const r = await xRetweetViaPuppeteer(forwardBrowserAccount, tweetId);
+        const statusHint = safeString(r?.status).trim() ? ` status=${safeString(r.status).trim()}` : "";
+        addLog(`[转发成功] retweet(browser) tweet_id=${tweetId}${statusHint}`);
+        pushForwarded(target, tweetId);
+        db.queue.splice(i, 1);
+        i -= 1;
+        if (shouldWait) await sleep(sendIntervalMs);
+        continue;
       }
 
       if (!xLoggedUserId) {
@@ -2995,6 +3277,7 @@ async function main() {
         if (incoming.forward.x.apiSecret !== undefined) next.forward.x.apiSecret = safeString(incoming.forward.x.apiSecret).trim();
         if (incoming.forward.x.accessToken !== undefined) next.forward.x.accessToken = safeString(incoming.forward.x.accessToken).trim();
         if (incoming.forward.x.accessSecret !== undefined) next.forward.x.accessSecret = safeString(incoming.forward.x.accessSecret).trim();
+        if (incoming.forward.x.profileDir !== undefined) next.forward.x.profileDir = safeString(incoming.forward.x.profileDir).trim();
       }
 
       configFile = next;
@@ -3057,14 +3340,35 @@ async function main() {
     if (!text) return res.status(400).json({ error: "缺少 text" });
 
     addLog("[测试] X create_tweet 发推测试");
-    let xClient;
-    let proxyUrl;
+    const forwardProfileDir = safeString(config?.forward?.x?.profileDir).trim();
+    const hasForwardProfile = Boolean(forwardProfileDir);
+
+    let xClient = null;
+    let proxyUrl = "";
+    let useBrowserMode = false;
     try {
       const created = createXClient(config);
       xClient = created.client;
       proxyUrl = created.proxyUrl;
     } catch (e) {
-      return res.status(400).json({ error: safeString(e?.message || e) });
+      if (hasForwardProfile) {
+        useBrowserMode = true;
+        proxyUrl = getXProxyUrl(config);
+      } else {
+        return res.status(400).json({ error: safeString(e?.message || e) });
+      }
+    }
+
+    if (useBrowserMode) {
+      const browserAccount = { id: "forward", name: "forward", proxy: getXProxyUrl(config), x: { profileDir: forwardProfileDir } };
+      let tweetId = "";
+      try {
+        stats.xCalls += 1;
+        tweetId = await bulkPostViaPuppeteer(browserAccount, truncateTweetText(text, 280), []);
+      } catch (e) {
+        return res.status(502).json({ error: `发帖失败[Puppeteer]: ${safeString(e?.message || e)}` });
+      }
+      return res.json({ ok: true, mode: "browser", profileDir: forwardProfileDir, proxy: redactUrlCredentials(proxyUrl), tweetId });
     }
 
     let apiRes;
@@ -3075,7 +3379,7 @@ async function main() {
       return res.status(502).json({ error: formatXError(e) });
     }
 
-    return res.json({ ok: true, proxy: redactUrlCredentials(proxyUrl), api: apiRes });
+    return res.json({ ok: true, mode: "api", proxy: redactUrlCredentials(proxyUrl), api: apiRes });
   }
 
   app.get("/api/test-fetch", handleTestFetch);
@@ -3096,14 +3400,40 @@ async function main() {
     if (!tweetId) return res.status(400).json({ error: "缺少 tweetId" });
 
     addLog(`[测试] X retweet 测试 tweet_id=${tweetId}`);
-    let xClient;
-    let proxyUrl;
+    const forwardProfileDir = safeString(config?.forward?.x?.profileDir).trim();
+    const hasForwardProfile = Boolean(forwardProfileDir);
+
+    let xClient = null;
+    let proxyUrl = "";
+    let useBrowserMode = false;
     try {
       const created = createXClient(config);
       xClient = created.client;
       proxyUrl = created.proxyUrl;
     } catch (e) {
-      return res.status(400).json({ error: safeString(e?.message || e) });
+      if (hasForwardProfile) {
+        useBrowserMode = true;
+        proxyUrl = getXProxyUrl(config);
+      } else {
+        return res.status(400).json({ error: safeString(e?.message || e) });
+      }
+    }
+
+    if (useBrowserMode) {
+      const browserAccount = { id: "forward", name: "forward", proxy: getXProxyUrl(config), x: { profileDir: forwardProfileDir } };
+      try {
+        stats.xCalls += 1;
+        const r = await xRetweetViaPuppeteer(browserAccount, tweetId);
+        return res.json({
+          ok: true,
+          mode: "browser",
+          profileDir: forwardProfileDir,
+          proxy: redactUrlCredentials(proxyUrl),
+          result: r,
+        });
+      } catch (e) {
+        return res.status(502).json({ error: `转推失败[Puppeteer]: ${safeString(e?.message || e)}` });
+      }
     }
 
     let loggedUserId = "";
@@ -3123,7 +3453,7 @@ async function main() {
       return res.status(502).json({ error: formatXError(e) });
     }
 
-    res.json({ ok: true, proxy: redactUrlCredentials(proxyUrl), api: apiRes });
+    res.json({ ok: true, mode: "api", proxy: redactUrlCredentials(proxyUrl), api: apiRes });
   });
 
   app.post("/api/test-repost", async (req, res) => {
@@ -3149,14 +3479,47 @@ async function main() {
       });
     }
 
-    let xClient;
-    let proxyUrl;
+    const forwardProfileDir = safeString(config?.forward?.x?.profileDir).trim();
+    const hasForwardProfile = Boolean(forwardProfileDir);
+
+    let xClient = null;
+    let proxyUrl = "";
+    let useBrowserMode = false;
     try {
       const created = createXClient(config);
       xClient = created.client;
       proxyUrl = created.proxyUrl;
     } catch (e) {
-      return res.status(400).json({ error: safeString(e?.message || e) });
+      if (hasForwardProfile) {
+        useBrowserMode = true;
+        proxyUrl = getXProxyUrl(config);
+      } else {
+        return res.status(400).json({ error: safeString(e?.message || e) });
+      }
+    }
+
+    if (useBrowserMode) {
+      const browserAccount = { id: "forward", name: "forward", proxy: getXProxyUrl(config), x: { profileDir: forwardProfileDir } };
+      const filePaths = (prepared.media || [])
+        .map((m) => path.join(prepared.downloadDir || "", safeString(m?.fileName).trim()))
+        .filter((p) => safeString(p).trim());
+
+      let newTweetId = "";
+      try {
+        stats.xCalls += 1;
+        newTweetId = await bulkPostViaPuppeteer(browserAccount, truncateTweetText(prepared.text || "", 280), filePaths);
+      } catch (e) {
+        return res.status(502).json({ error: `发帖失败[Puppeteer]: ${safeString(e?.message || e)}` });
+      }
+
+      return res.json({
+        ok: true,
+        mode: "browser",
+        profileDir: forwardProfileDir,
+        proxy: redactUrlCredentials(proxyUrl),
+        source: { tweetId: prepared.tweetId, photos: prepared.photoUrls?.length || 0, saved: prepared.downloadDir },
+        posted: { tweetId: newTweetId || "" },
+      });
     }
 
     let mediaIds;
@@ -3180,6 +3543,7 @@ async function main() {
 
     return res.json({
       ok: true,
+      mode: "api",
       proxy: redactUrlCredentials(proxyUrl),
       source: { tweetId: prepared.tweetId, photos: prepared.photoUrls?.length || 0, saved: prepared.downloadDir },
       posted: apiRes,
@@ -3188,14 +3552,34 @@ async function main() {
 
   app.get("/api/test-x-auth", async (_req, res) => {
     addLog("[测试] X auth 测试：v2.me");
-    let xClient;
-    let proxyUrl;
+    const forwardProfileDir = safeString(config?.forward?.x?.profileDir).trim();
+    const hasForwardProfile = Boolean(forwardProfileDir);
+
+    let xClient = null;
+    let proxyUrl = "";
+    let useBrowserMode = false;
     try {
       const created = createXClient(config);
       xClient = created.client;
       proxyUrl = created.proxyUrl;
     } catch (e) {
-      return res.status(400).json({ error: safeString(e?.message || e) });
+      if (hasForwardProfile) {
+        useBrowserMode = true;
+        proxyUrl = getXProxyUrl(config);
+      } else {
+        return res.status(400).json({ error: safeString(e?.message || e) });
+      }
+    }
+
+    if (useBrowserMode) {
+      const browserAccount = { id: "forward", name: "forward", proxy: getXProxyUrl(config), x: { profileDir: forwardProfileDir } };
+      try {
+        stats.xCalls += 1;
+        const r = await xAuthViaPuppeteer(browserAccount);
+        return res.json({ ok: true, mode: "browser", profileDir: forwardProfileDir, proxy: redactUrlCredentials(proxyUrl), result: r });
+      } catch (e) {
+        return res.status(502).json({ error: `验证失败[Puppeteer]: ${safeString(e?.message || e)}` });
+      }
     }
 
     let apiRes;
@@ -3205,7 +3589,7 @@ async function main() {
     } catch (e) {
       return res.status(502).json({ error: formatXError(e) });
     }
-    return res.json({ ok: true, proxy: redactUrlCredentials(proxyUrl), api: apiRes });
+    return res.json({ ok: true, mode: "api", proxy: redactUrlCredentials(proxyUrl), api: apiRes });
   });
 
   app.post("/api/monitor/start", async (_req, res) => {
@@ -3765,6 +4149,43 @@ async function main() {
       return res.status(500).json({ error: err });
     }
   }
+
+  async function handleForwardOpenLogin(_req, res) {
+    try {
+      const next = configFile && typeof configFile === "object" ? configFile : {};
+      next.forward = next.forward || {};
+      next.forward.x = next.forward.x || {};
+
+      // 若未设置，则为主面板分配一个默认 Profile 目录（相对 APP_DIR）
+      if (!safeString(next.forward.x.profileDir).trim()) {
+        next.forward.x.profileDir = defaultBulkBrowserProfileDirValue("forward");
+      }
+
+      const acc = {
+        id: "forward",
+        name: "forward",
+        proxy: getXProxyUrl(config),
+        x: { profileDir: safeString(next.forward.x.profileDir).trim() },
+      };
+
+      const result = await loginTwitterViaBrowser(acc);
+      if (result?.profileDir) next.forward.x.profileDir = safeString(result.profileDir).trim() || next.forward.x.profileDir;
+
+      configFile = next;
+      await writeJson(CONFIG_PATH, configFile);
+      config = applyEnvOverrides(configFile);
+
+      addLog(`[登录] 已保存浏览器 Profile：dir=${safeString(next.forward.x.profileDir)}`);
+      return res.json({ ok: true, msg: "登录完成，已保存 Profile（转发/发帖将复用）", profileDir: next.forward.x.profileDir });
+    } catch (e) {
+      const err = safeString(e?.message || e);
+      addLog(`[登录] 失败：${err}`);
+      return res.status(500).json({ error: err });
+    }
+  }
+
+  // 主面板登录：保存 Profile（用于监控转发/发帖）
+  app.post("/api/open-login", handleForwardOpenLogin);
 
   // 浏览器登录（推荐）：保存 Profile；兼容旧按钮路径
   app.post("/api/bulk/open-login", handleBulkOpenLogin);

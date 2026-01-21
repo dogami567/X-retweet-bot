@@ -1,0 +1,140 @@
+name: build-and-release
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 18
+          cache: npm
+
+      - name: Install
+        run: npm ci
+
+      - name: Build EXE + ZIP
+        run: npm run release:exe
+
+      - name: Rename artifact
+        shell: pwsh
+        run: |
+          $ref = "${{ github.ref_name }}"
+          $sha = "${{ github.sha }}".Substring(0, 7)
+          $ver = if ($ref -like "v*") { $ref } else { "dev-$sha" }
+          $src = "X-get2put-exe.zip"
+          $dst = "X-get2put-$ver-win-x64.zip"
+          if (!(Test-Path $src)) { throw "Missing $src" }
+          Move-Item -Force $src $dst
+          Write-Host "Artifact: $dst"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: X-get2put-*.zip
+
+  build-macos:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 18
+          cache: npm
+
+      - name: Install
+        run: npm ci
+
+      - name: Build packages (arm64/x64) + DMG
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          REF_NAME="${{ github.ref_name }}"
+          SHA="${{ github.sha }}"
+          SHORT_SHA="${SHA:0:7}"
+          if [[ "$REF_NAME" == v* ]]; then
+            VERSION="$REF_NAME"
+          else
+            VERSION="dev-$SHORT_SHA"
+          fi
+
+          mkdir -p dist-mac
+
+          npx pkg server.js --config package.json --targets node18-macos-arm64 --output dist-mac/X-get2put-macos-arm64
+          npx pkg server.js --config package.json --targets node18-macos-x64 --output dist-mac/X-get2put-macos-x64
+
+          for ARCH in arm64 x64; do
+            BIN="dist-mac/X-get2put-macos-$ARCH"
+            PKG_DIR="dist-mac/package-$ARCH/X-get2put"
+
+            rm -rf "$PKG_DIR"
+            mkdir -p "$PKG_DIR/data"
+
+            cp "$BIN" "$PKG_DIR/X-get2put"
+            chmod +x "$PKG_DIR/X-get2put"
+            cp README.md "$PKG_DIR/README.md"
+            cp .env.empty "$PKG_DIR/.env"
+            cp .env.example "$PKG_DIR/.env.example"
+
+            cat > "$PKG_DIR/X-get2put.command" <<'EOF'
+#!/bin/bash
+set -e
+DIR="$(cd "$(dirname "$0")" && pwd)"
+chmod +x "$DIR/X-get2put"
+"$DIR/X-get2put"
+EOF
+            chmod +x "$PKG_DIR/X-get2put.command"
+
+            ZIP="dist-mac/X-get2put-$VERSION-macos-$ARCH.zip"
+            DMG="dist-mac/X-get2put-$VERSION-macos-$ARCH.dmg"
+
+            ditto -c -k --sequesterRsrc --keepParent "$PKG_DIR" "$ZIP"
+            hdiutil create -volname "X-get2put" -srcfolder "$PKG_DIR" -ov -format UDZO "$DMG"
+            echo "Built: $ZIP"
+            echo "Built: $DMG"
+          done
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos
+          path: |
+            dist-mac/X-get2put-*.zip
+            dist-mac/X-get2put-*.dmg
+
+  release:
+    needs: [build-windows, build-macos]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-artifacts
+
+      - name: List artifacts
+        run: ls -R release-artifacts
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            release-artifacts/**/*
