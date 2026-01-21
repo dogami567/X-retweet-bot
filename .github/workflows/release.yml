@@ -14,6 +14,15 @@ jobs:
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/v')
     steps:
+      - name: Checkout (git)
+        shell: bash
+        run: |
+          set -euo pipefail
+          git init
+          git remote add origin https://github.com/${{ github.repository }}.git
+          git fetch --depth 1 origin ${{ github.sha }}
+          git checkout FETCH_HEAD
+
       - name: Create GitHub Release (gh)
         env:
           GH_TOKEN: ${{ github.token }}
@@ -21,11 +30,32 @@ jobs:
         run: |
           set -euo pipefail
           TAG="${GITHUB_REF_NAME}"
+
+          NOTES_FILE="release-notes.md"
+          if [ -f CHANGELOG.md ] && grep -q "^## ${TAG} " CHANGELOG.md; then
+            awk -v tag="$TAG" '
+              BEGIN{found=0}
+              /^## / {
+                if (found && $0 !~ ("^## " tag " ")) exit
+                if ($0 ~ ("^## " tag " ")) found=1
+              }
+              found {print}
+            ' CHANGELOG.md > "$NOTES_FILE"
+          fi
+
           if gh release view "$TAG" >/dev/null 2>&1; then
             echo "Release already exists: $TAG"
+            if [ -f "$NOTES_FILE" ]; then
+              gh release edit "$TAG" --notes-file "$NOTES_FILE"
+            fi
             exit 0
           fi
-          gh release create "$TAG" --generate-notes
+
+          if [ -f "$NOTES_FILE" ]; then
+            gh release create "$TAG" --title "$TAG" --notes-file "$NOTES_FILE"
+          else
+            gh release create "$TAG" --generate-notes
+          fi
 
   build-windows:
     runs-on: windows-latest
