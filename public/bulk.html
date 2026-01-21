@@ -205,10 +205,20 @@
                 <div class="small text-muted mb-2">
                     输入某个 X 帖子链接后，点击开始：系统会让勾选了「关注评论」的账号去关注该帖下的评论用户（每天每号最多 300）。
                 </div>
-                <div class="input-group">
-                    <span class="input-group-text bg-light"><i class="bi bi-link-45deg"></i></span>
-                    <input class="form-control mono" id="followTweetUrl" placeholder="https://x.com/.../status/...">
-                    <button class="btn btn-outline-secondary" id="btnFollowCommentersStatus" type="button"><i class="bi bi-arrow-repeat"></i></button>
+                <div class="row g-2 align-items-end">
+                    <div class="col-12 col-lg-8">
+                        <label class="form-label small text-muted mb-1">推文链接</label>
+                        <div class="input-group">
+                            <span class="input-group-text bg-light"><i class="bi bi-link-45deg"></i></span>
+                            <input class="form-control mono" id="followTweetUrl" placeholder="https://x.com/.../status/...">
+                            <button class="btn btn-outline-secondary" id="btnFollowCommentersStatus" type="button" title="刷新状态"><i class="bi bi-arrow-repeat"></i></button>
+                        </div>
+                    </div>
+                    <div class="col-12 col-lg-4">
+                        <label class="form-label small text-muted mb-1">每号本次关注上限</label>
+                        <input class="form-control" type="number" id="followMaxPerAccount" value="30" min="1" max="300">
+                        <div class="form-text small">例如填 10：每个账号最多成功关注 10 个（跳过不计入）。</div>
+                    </div>
                 </div>
                 <div class="form-text small" id="followJobHint">状态：-</div>
             </div>

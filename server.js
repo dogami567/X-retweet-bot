@@ -816,6 +816,7 @@ function resetBulkFollowJob() {
   bulkFollowJob = {
     running: false,
     tweetUrl: "",
+    maxPerAccount: 0,
     startedAt: "",
     finishedAt: "",
     stopRequested: false,
@@ -1003,8 +1004,10 @@ async function bulkFollowCommentersForAccount(account, tweetUrl, options = {}) {
     await page.waitForSelector("article", { timeout: 15_000 }).catch(() => {});
     await sleep(900);
 
-    const remain = Math.max(0, Math.round(Number(options.remain || 0)));
-    const maxToCollect = Math.min(5000, Math.max(600, remain * 3));
+    const remainDaily = Math.max(0, Math.round(Number(options.remainDaily || 0)));
+    const maxFollow = Math.max(1, Math.round(Number(options.maxFollow || 0) || 1));
+    const effectiveFollowLimit = Math.max(1, Math.min(remainDaily || maxFollow, maxFollow));
+    const maxToCollect = Math.min(5000, Math.max(300, effectiveFollowLimit * 3));
     const authorFromUrl = extractStatusAuthorFromUrl(tweetUrl);
 
     const handles = await collectCommenterUsernames(page, {
@@ -1018,6 +1021,7 @@ async function bulkFollowCommentersForAccount(account, tweetUrl, options = {}) {
 
     for (const h of handles) {
       if (isBulkFollowStopRequested()) break;
+      if (summary.followed >= effectiveFollowLimit) break;
 
       const state = upsertBulkState(a.id);
       ensureBulkFollowDailyState(state);
@@ -1065,6 +1069,9 @@ async function bulkFollowCommentersForAccount(account, tweetUrl, options = {}) {
 
       if (r.status === "followed" || r.status === "clicked") {
         summary.followed += 1;
+        if (summary.followed >= effectiveFollowLimit) {
+          addBulkLog(`[关注] 已达本次上限 account=${safeString(a.name || a.id)} limit=${effectiveFollowLimit}`);
+        }
         const state = upsertBulkState(a.id);
         ensureBulkFollowDailyState(state);
         state.followDailyCount = Math.max(0, Math.round(Number(state.followDailyCount) || 0)) + 1;
@@ -1087,17 +1094,21 @@ async function bulkFollowCommentersForAccount(account, tweetUrl, options = {}) {
   }
 }
 
-async function runBulkFollowCommenters(tweetUrl) {
+async function runBulkFollowCommenters(tweetUrl, options = {}) {
   const url = normalizeXStatusUrl(tweetUrl);
   if (!url) throw new Error("缺少 tweetUrl");
   if (!isLikelyXStatusUrl(url)) throw new Error("链接不合法：请提供 X 推文链接（包含 /status/）");
 
   if (bulkFollowJob?.running) throw new Error("关注任务正在运行中，请先停止或等待结束");
 
+  const maxPerAccountRaw = Math.round(Number(options?.maxPerAccount) || 30);
+  const maxPerAccount = Math.max(1, Math.min(BULK_FOLLOW_COMMENTERS_DAILY_LIMIT, maxPerAccountRaw));
+
   bulkFollowStopRequested = false;
   bulkFollowJob.running = true;
   bulkFollowJob.stopRequested = false;
   bulkFollowJob.tweetUrl = url;
+  bulkFollowJob.maxPerAccount = maxPerAccount;
   bulkFollowJob.startedAt = nowIso();
   bulkFollowJob.finishedAt = "";
   bulkFollowJob.accountsDone = 0;
@@ -1105,7 +1116,9 @@ async function runBulkFollowCommenters(tweetUrl) {
   const accounts = getBulkAccounts().filter((a) => Boolean(a?.followCommentersEnabled));
   bulkFollowJob.accountsTotal = accounts.length;
 
-  addBulkLog(`[关注] 开始 tweet=${url} accounts=${accounts.length} limit=每天每号${BULK_FOLLOW_COMMENTERS_DAILY_LIMIT}`);
+  addBulkLog(
+    `[关注] 开始 tweet=${url} accounts=${accounts.length} limit=本次每号${maxPerAccount}, 每天每号${BULK_FOLLOW_COMMENTERS_DAILY_LIMIT}`,
+  );
 
   for (const a of accounts) {
     if (isBulkFollowStopRequested()) break;
@@ -1126,9 +1139,16 @@ async function runBulkFollowCommenters(tweetUrl) {
     state.followLastError = "";
     state.followLastErrorAt = "";
 
-    const remain = getBulkFollowRemaining(state);
-    if (remain <= 0) {
+    const remainDaily = getBulkFollowRemaining(state);
+    const remain = Math.min(remainDaily, maxPerAccount);
+    if (remainDaily <= 0) {
       addBulkLog(`[关注] 今日已达上限，跳过 account=${safeString(a.name || a.id)} today=${state.followDailyCount}/${BULK_FOLLOW_COMMENTERS_DAILY_LIMIT}`);
+      state.followRunning = false;
+      bulkFollowJob.accountsDone += 1;
+      continue;
+    }
+    if (remain <= 0) {
+      addBulkLog(`[关注] 已达本次上限，跳过 account=${safeString(a.name || a.id)} perRun=${maxPerAccount}`);
       state.followRunning = false;
       bulkFollowJob.accountsDone += 1;
       continue;
@@ -1136,7 +1156,7 @@ async function runBulkFollowCommenters(tweetUrl) {
 
     try {
       // eslint-disable-next-line no-await-in-loop
-      const r = await bulkFollowCommentersForAccount(a, url, { remain });
+      const r = await bulkFollowCommentersForAccount(a, url, { remainDaily, maxFollow: remain });
       state.followDone = Number(r?.followed || 0);
       state.followSkipped = Number(r?.skipped || 0);
       state.followWarnings = Number(r?.warnings || 0);
@@ -1950,6 +1970,7 @@ const bulkStates = new Map(); // accountId -> state
 let bulkFollowJob = {
   running: false,
   tweetUrl: "",
+  maxPerAccount: 0,
   startedAt: "",
   finishedAt: "",
   stopRequested: false,
@@ -3405,6 +3426,7 @@ async function main() {
     try {
       const tweetUrl = safeString(req.body?.tweetUrl).trim();
       if (!tweetUrl) return res.status(400).json({ error: "缺少 tweetUrl" });
+      const maxPerAccount = Math.round(Number(req.body?.maxPerAccount) || 30);
 
       if (bulkFollowJob?.running) return res.status(409).json({ error: "关注任务正在运行中" });
 
@@ -3415,7 +3437,7 @@ async function main() {
       if (accounts.length === 0) return res.status(400).json({ error: "没有可执行账号：请在账号里勾选「关注评论」" });
 
       // 启动后台任务（不阻塞接口）
-      runBulkFollowCommenters(url).catch((e) => {
+      runBulkFollowCommenters(url, { maxPerAccount }).catch((e) => {
         const err = safeString(e?.message || e);
         addBulkLog(`[关注] 全局任务异常：${err}`);
         bulkFollowJob.running = false;

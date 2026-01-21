@@ -1,6 +1,6 @@
 {
   "name": "x-get2put",
-  "version": "0.3.4",
+  "version": "0.3.5",
   "private": true,
   "description": "TwitterAPI.io 监控与转发系统（本地测试面板 + 轮询监控）",
   "main": "server.js",

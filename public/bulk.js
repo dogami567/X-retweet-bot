@@ -375,6 +375,7 @@ function setFollowJobHint(job) {
   const running = Boolean(j.running);
   const stopRequested = Boolean(j.stopRequested);
   const url = String(j.tweetUrl || "").trim();
+  const maxPerAccount = Number(j.maxPerAccount ?? 0);
   const startedAt = j.startedAt ? new Date(j.startedAt).toLocaleString() : "";
   const finishedAt = j.finishedAt ? new Date(j.finishedAt).toLocaleString() : "";
 
@@ -382,12 +383,14 @@ function setFollowJobHint(job) {
     const total = Number(j.accountsTotal ?? 0);
     const done = Number(j.accountsDone ?? 0);
     const status = stopRequested ? "运行中（已请求停止）" : "运行中";
-    el.textContent = `状态：${status} | 进度：${done}/${total} | 开始：${startedAt || "-"}`;
+    const limitText = maxPerAccount > 0 ? ` | 本次每号上限：${maxPerAccount}` : "";
+    el.textContent = `状态：${status} | 进度：${done}/${total}${limitText} | 开始：${startedAt || "-"}`;
     return;
   }
 
   if (finishedAt) {
-    el.textContent = `状态：已结束 | 结束：${finishedAt} | 链接：${url || "-"}`;
+    const limitText = maxPerAccount > 0 ? ` | 本次每号上限：${maxPerAccount}` : "";
+    el.textContent = `状态：已结束 | 结束：${finishedAt}${limitText} | 链接：${url || "-"}`;
     return;
   }
 
@@ -401,7 +404,11 @@ async function followCommentersStart() {
   const tweetUrl = byId("followTweetUrl")?.value?.trim() || "";
   if (!tweetUrl) throw new Error("请先填写 X 帖子链接");
 
-  const res = await api("/api/bulk/follow-commenters/start", { method: "POST", body: JSON.stringify({ tweetUrl }) });
+  const maxPerAccount = Number(byId("followMaxPerAccount")?.value || 30);
+  const res = await api("/api/bulk/follow-commenters/start", {
+    method: "POST",
+    body: JSON.stringify({ tweetUrl, maxPerAccount }),
+  });
   setJsonBox(res);
   setFollowJobHint(res?.job || res?.followJob || null);
   await refreshLogs({ silent: true }).catch(() => {});
