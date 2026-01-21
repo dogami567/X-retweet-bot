@@ -17,6 +17,7 @@ jobs:
       - name: Create GitHub Release (gh)
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
           TAG="${GITHUB_REF_NAME}"
@@ -24,7 +25,7 @@ jobs:
             echo "Release already exists: $TAG"
             exit 0
           fi
-          gh release create "$TAG" --generate-notes --verify-tag
+          gh release create "$TAG" --generate-notes
 
   build-windows:
     runs-on: windows-latest
@@ -59,6 +60,7 @@ jobs:
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
         run: |
           $tag = "${{ github.ref_name }}"
           $file = "X-get2put-$tag-win-x64.zip"
@@ -128,6 +130,7 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
           TAG="${GITHUB_REF_NAME}"
