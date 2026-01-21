@@ -106,13 +106,13 @@ jobs:
             cp .env.empty "$PKG_DIR/.env"
             cp .env.example "$PKG_DIR/.env.example"
 
-            cat > "$PKG_DIR/X-get2put.command" <<'EOF'
-#!/bin/bash
-set -e
-DIR="$(cd "$(dirname "$0")" && pwd)"
-chmod +x "$DIR/X-get2put"
-"$DIR/X-get2put"
-EOF
+            printf '%s\n' \
+              '#!/bin/bash' \
+              'set -e' \
+              'DIR="$(cd "$(dirname "$0")" && pwd)"' \
+              'chmod +x "$DIR/X-get2put"' \
+              '"$DIR/X-get2put"' \
+              > "$PKG_DIR/X-get2put.command"
             chmod +x "$PKG_DIR/X-get2put.command"
 
             ZIP="dist-mac/X-get2put-$VERSION-macos-$ARCH.zip"
