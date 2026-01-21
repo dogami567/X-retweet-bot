@@ -1111,8 +1111,8 @@ async function scanVisibleCommenterUsernames(page, excludeAuthor) {
         document.body;
       const out = [];
 
-      const tweetArticles = Array.from(root.querySelectorAll('article[data-testid="tweet"]'));
-      const articles = tweetArticles.length ? tweetArticles : Array.from(root.querySelectorAll("article"));
+      const tweetNodes = Array.from(root.querySelectorAll('[data-testid="tweet"]'));
+      const articles = tweetNodes.length ? tweetNodes : Array.from(root.querySelectorAll("article"));
       for (const article of articles) {
         // 说明：这里返回“目标”字符串：
         // - 普通情况：返回用户名（不带 @）
@@ -1141,11 +1141,21 @@ async function scanVisibleCommenterUsernames(page, excludeAuthor) {
           h = parseTargetFromHref(href);
         }
 
+        // 兜底：从头像区链接解析（XActions 里常用该选择器）
+        if (!h) {
+          const aAvatar = article.querySelector(
+            '[data-testid="UserAvatar-Container"] a[href], [data-testid="UserAvatar-Container"] [role="link"][href]',
+          );
+          const href = aAvatar ? aAvatar.getAttribute("href") || aAvatar.href || "" : "";
+          h = parseTargetFromHref(href);
+        }
+
         // 兜底：某些 UI 结构可能没有 data-testid="User-Name"，再从 article 内挑选“非正文(tweetText)区域”的主页链接
         // 注意：正文里也可能包含 @ 提及链接，因此这里排除 tweetText 容器，减少误抓概率。
         if (!h) {
           try {
-            const links = Array.from(article.querySelectorAll('a[href][role="link"]'));
+            // 这里不要强依赖 role="link"：某些布局/实验组里 a 标签可能没有 role
+            const links = Array.from(article.querySelectorAll("a[href]"));
             for (const a of links) {
               if (a.closest('[data-testid="tweetText"]')) continue;
               const href = a.getAttribute("href") || a.href || "";
@@ -1389,6 +1399,8 @@ async function bulkFollowCommentersForAccount(account, tweetUrl, options = {}) {
     const maxRounds = 260;
     const maxNoNewRounds = 8;
     const maxScanUsers = Math.min(5000, Math.max(150, effectiveFollowLimit * 12));
+    const startAt = Date.now();
+    const maxEmptyScanMs = 8 * 60_000;
 
     const seen = new Set();
     const pending = [];
@@ -1461,7 +1473,7 @@ async function bulkFollowCommentersForAccount(account, tweetUrl, options = {}) {
               document.querySelector('[data-testid="primaryColumn"]') ||
               document.querySelector('main[role="main"]') ||
               document.body;
-            const n = root.querySelectorAll('article[data-testid="tweet"]').length;
+            const n = root.querySelectorAll('[data-testid="tweet"]').length;
             return Number(n || 0);
           })
           .catch(() => 0);
@@ -1469,6 +1481,49 @@ async function bulkFollowCommentersForAccount(account, tweetUrl, options = {}) {
           lastTweetCount = tweetCountNow;
           // 即使暂时没扫到新用户名，只要页面内容还在增长，就不要过快触发“无新增”提前结束
           if (added === 0) noNewRounds = 0;
+        }
+
+        // 如果一直扫不到任何评论用户，但页面内容还在增长，就会出现“无限滚动”的错觉。
+        // 这里加一个时间上限与更频繁的诊断日志，方便定位页面结构/登录态问题。
+        if (seen.size === 0) {
+          const elapsed = Date.now() - startAt;
+          if (elapsed >= maxEmptyScanMs) {
+            summary.warnings += 1;
+            addBulkLog(
+              `[关注][WARN] 连续扫描仍未获取到任何评论用户，停止以避免无限滚动 account=${safeString(a.name || a.id)} elapsedSec=${Math.round(elapsed / 1000)} url=${safeString(
+                commentPage.url(),
+              )}`,
+            );
+            break;
+          }
+
+          // 每 5 轮输出一次轻量诊断，避免用户以为“卡住没做事”
+          if (rounds % 5 === 0) {
+            const diag = await commentPage
+              .evaluate(() => {
+                const root =
+                  document.querySelector('[data-testid="primaryColumn"]') ||
+                  document.querySelector('main[role="main"]') ||
+                  document.body;
+                const tweets = root.querySelectorAll('[data-testid="tweet"]').length;
+                const articles = root.querySelectorAll("article").length;
+                const userName = root.querySelectorAll('[data-testid="User-Name"]').length;
+                const userNameLinks = root.querySelectorAll('[data-testid="User-Name"] a[href]').length;
+                const avatarLinks = root.querySelectorAll('[data-testid="UserAvatar-Container"] a[href]').length;
+                const statusLinks = root.querySelectorAll('a[href*="/status/"]').length;
+                return { tweets, articles, userName, userNameLinks, avatarLinks, statusLinks };
+              })
+              .catch(() => null);
+            if (diag && typeof diag === "object") {
+              addBulkLog(
+                `[关注][DBG] 扫描中 rounds=${rounds} tweets=${Number(diag.tweets || 0)} articles=${Number(diag.articles || 0)} userName=${Number(
+                  diag.userName || 0,
+                )} userNameLinks=${Number(diag.userNameLinks || 0)} avatarLinks=${Number(diag.avatarLinks || 0)} statusLinks=${Number(
+                  diag.statusLinks || 0,
+                )}`,
+              );
+            }
+          }
         }
 
         if (!emptyDiagLogged && seen.size === 0 && rounds >= 6) {
