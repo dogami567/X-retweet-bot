@@ -126,8 +126,9 @@ jobs:
 
           mkdir -p dist-mac
 
-          npx pkg server.js --config package.json --targets node18-macos-arm64 --output dist-mac/X-get2put-macos-arm64
-          npx pkg server.js --config package.json --targets node18-macos-x64 --output dist-mac/X-get2put-macos-x64
+          # macOS 上 pkg 偶发拉不到预编译基座导致失败，这里改用更稳定的 @yao-pkg/pkg
+          npx -y @yao-pkg/pkg@6.12.0 server.js --config package.json --targets node18-macos-arm64 --output dist-mac/X-get2put-macos-arm64
+          npx -y @yao-pkg/pkg@6.12.0 server.js --config package.json --targets node18-macos-x64 --output dist-mac/X-get2put-macos-x64
 
           for ARCH in arm64 x64; do
             BIN="dist-mac/X-get2put-macos-$ARCH"
@@ -155,9 +156,10 @@ jobs:
             DMG="dist-mac/X-get2put-$VERSION-macos-$ARCH.dmg"
 
             ditto -c -k --sequesterRsrc --keepParent "$PKG_DIR" "$ZIP"
-            hdiutil create -volname "X-get2put" -srcfolder "$PKG_DIR" -ov -format UDZO "$DMG"
+            # DMG 偶发失败不应阻断发布：至少保证 ZIP 可用
+            hdiutil create -volname "X-get2put" -srcfolder "$PKG_DIR" -ov -format UDZO "$DMG" || echo "WARN: DMG build failed for $ARCH"
             echo "Built: $ZIP"
-            echo "Built: $DMG"
+            [ -f "$DMG" ] && echo "Built: $DMG" || echo "Skipped: $DMG"
           done
 
       - name: Upload to Release (gh)
@@ -168,4 +170,17 @@ jobs:
         run: |
           set -euo pipefail
           TAG="${GITHUB_REF_NAME}"
-          gh release upload "$TAG" dist-mac/X-get2put-"$TAG"-macos-*.zip dist-mac/X-get2put-"$TAG"-macos-*.dmg --clobber
+
+          files=()
+          for f in dist-mac/X-get2put-"$TAG"-macos-*.zip dist-mac/X-get2put-"$TAG"-macos-*.dmg; do
+            if [ -f "$f" ]; then
+              files+=("$f")
+            fi
+          done
+
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "No macOS artifacts found to upload."
+            exit 1
+          fi
+
+          gh release upload "$TAG" "${files[@]}" --clobber
