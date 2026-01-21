@@ -1877,6 +1877,10 @@ function addLog(message, extra) {
   };
   logs.push(entry);
   while (logs.length > LOG_LIMIT) logs.shift();
+
+  // 打包 exe 场景下，用户通常更依赖控制台/日志文件来定位问题。
+  // 将关键日志同步输出到控制台，方便用户截图/复制反馈。
+  if (process.pkg) console.log(`[${entry.time}] ${entry.message}`);
 }
 
 function addBulkLog(message, extra) {
@@ -1886,6 +1890,8 @@ function addBulkLog(message, extra) {
   };
   bulkLogs.push(entry);
   while (bulkLogs.length > BULK_LOG_LIMIT) bulkLogs.shift();
+
+  if (process.pkg) console.log(`[${entry.time}] ${entry.message}`);
 }
 
 function createTwitterClient(config) {

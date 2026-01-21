@@ -17,6 +17,20 @@ function byId(id) {
   return document.getElementById(id);
 }
 
+function showLogsTab() {
+  const trigger = document.querySelector('a[data-bs-toggle="tab"][href="#tabLogs"]');
+  if (!trigger) return;
+
+  try {
+    if (window.bootstrap && bootstrap.Tab) bootstrap.Tab.getOrCreateInstance(trigger).show();
+    else trigger.click();
+  } catch {
+    try {
+      trigger.click();
+    } catch {}
+  }
+}
+
 function safeJson(obj) {
   return JSON.stringify(obj ?? {}, null, 2);
 }
@@ -411,6 +425,7 @@ async function followCommentersStart() {
   });
   setJsonBox(res);
   setFollowJobHint(res?.job || res?.followJob || null);
+  showLogsTab();
   await refreshLogs({ silent: true }).catch(() => {});
   await refreshStatus({ silent: true }).catch(() => {});
 }
@@ -682,7 +697,15 @@ async function refreshLogs(options = {}) {
   if (!silent) setJsonBox(data);
   setRunningBadge(Boolean(data?.running));
   const lines = (data?.logs || []).map((l) => `[${l.time}] ${l.message}`);
-  byId("bulkLogBox").textContent = lines.join("\n");
+
+  const box = byId("bulkLogBox");
+  if (!box) return;
+  const prevScrollTop = box.scrollTop;
+  const stickToBottom = prevScrollTop + box.clientHeight >= box.scrollHeight - 24;
+
+  box.textContent = lines.join("\n");
+  if (stickToBottom) box.scrollTop = box.scrollHeight;
+  else box.scrollTop = prevScrollTop;
 }
 
 function renderStatusTable(accounts) {
