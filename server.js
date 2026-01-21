@@ -933,6 +933,23 @@ function isLoginLikeUrl(url) {
   return u.includes("/login") || u.includes("/i/flow/login");
 }
 
+async function detectXLoggedIn(page) {
+  const uiLoggedIn = await page
+    .evaluate(() => {
+      return Boolean(
+        document.querySelector('[data-testid="SideNav_AccountSwitcher_Button"]') ||
+          document.querySelector('[data-testid="SideNav_NewTweet_Button"]') ||
+          document.querySelector('[data-testid="AppTabBar_Home_Link"]') ||
+          document.querySelector('[data-testid="AppTabBar_Profile_Link"]'),
+      );
+    })
+    .catch(() => false);
+  if (uiLoggedIn) return true;
+
+  const cookies = await page.cookies("https://x.com", "https://twitter.com").catch(() => []);
+  return cookies.some((c) => c && (c.name === "auth_token" || c.name === "ct0"));
+}
+
 function isBulkFollowStopRequested() {
   return bulkFollowStopRequested === true;
 }
@@ -1257,6 +1274,9 @@ async function bulkFollowCommentersForAccount(account, tweetUrl, options = {}) {
   await fs.mkdir(profileDir, { recursive: true });
 
   const proxyUrl = getBulkProxyUrl(a);
+  addBulkLog(
+    `[关注][DBG] 启动浏览器 exe=${safeString(exe)} profile=${safeString(profileDirValue)} resolved=${safeString(profileDir)} proxy=${redactUrlCredentials(proxyUrl)}`,
+  );
   const args = [
     "--disable-blink-features=AutomationControlled",
     "--no-first-run",
@@ -1322,6 +1342,9 @@ async function bulkFollowCommentersForAccount(account, tweetUrl, options = {}) {
 
     if (isLoginLikeUrl(commentPage.url())) {
       throw new Error("未登录：请先点“打开浏览器登录”完成登录");
+    }
+    if (!(await detectXLoggedIn(commentPage))) {
+      throw new Error("未登录/登录态无效：请先点“打开浏览器登录”完成登录（注意：exe 版与 npm 版 Profile 不共用）");
     }
 
     await commentPage.waitForSelector("article", { timeout: 15_000 }).catch(() => {});
@@ -1464,169 +1487,172 @@ async function bulkFollowCommentersForAccount(account, tweetUrl, options = {}) {
           );
         }
 
-        // 首轮/弱网时评论加载可能较慢：seen=0 时多给一些轮次，避免刚开始就判定“无评论”
-        const noNewLimit = seen.size === 0 ? 80 : maxNoNewRounds;
+        // 一旦扫描到可关注目标，立刻去关注，避免继续滚动导致“看起来一直在滑”
+        if (pending.length === 0) {
+          // 首轮/弱网时评论加载可能较慢：seen=0 时多给一些轮次，避免刚开始就判定“无评论”
+          const noNewLimit = seen.size === 0 ? 80 : maxNoNewRounds;
 
-        const tweetCountNow = await commentPage
-          .evaluate(() => {
-            const root =
-              document.querySelector('[data-testid="primaryColumn"]') ||
-              document.querySelector('main[role="main"]') ||
-              document.body;
-            const n = root.querySelectorAll('[data-testid="tweet"]').length;
-            return Number(n || 0);
-          })
-          .catch(() => 0);
-        if (tweetCountNow > lastTweetCount) {
-          lastTweetCount = tweetCountNow;
-          // 即使暂时没扫到新用户名，只要页面内容还在增长，就不要过快触发“无新增”提前结束
-          if (added === 0) noNewRounds = 0;
-        }
-
-        // 如果一直扫不到任何评论用户，但页面内容还在增长，就会出现“无限滚动”的错觉。
-        // 这里加一个时间上限与更频繁的诊断日志，方便定位页面结构/登录态问题。
-        if (seen.size === 0) {
-          const elapsed = Date.now() - startAt;
-          if (elapsed >= maxEmptyScanMs) {
-            summary.warnings += 1;
-            addBulkLog(
-              `[关注][WARN] 连续扫描仍未获取到任何评论用户，停止以避免无限滚动 account=${safeString(a.name || a.id)} elapsedSec=${Math.round(elapsed / 1000)} url=${safeString(
-                commentPage.url(),
-              )}`,
-            );
-            break;
+          const tweetCountNow = await commentPage
+            .evaluate(() => {
+              const root =
+                document.querySelector('[data-testid="primaryColumn"]') ||
+                document.querySelector('main[role="main"]') ||
+                document.body;
+              const n = root.querySelectorAll('[data-testid="tweet"]').length;
+              return Number(n || 0);
+            })
+            .catch(() => 0);
+          if (tweetCountNow > lastTweetCount) {
+            lastTweetCount = tweetCountNow;
+            // 即使暂时没扫到新用户名，只要页面内容还在增长，就不要过快触发“无新增”提前结束
+            if (added === 0) noNewRounds = 0;
           }
 
-          // 每 5 轮输出一次轻量诊断，避免用户以为“卡住没做事”
-          if (rounds % 5 === 0) {
+          // 如果一直扫不到任何评论用户，但页面内容还在增长，就会出现“无限滚动”的错觉。
+          // 这里加一个时间上限与更频繁的诊断日志，方便定位页面结构/登录态问题。
+          if (seen.size === 0) {
+            const elapsed = Date.now() - startAt;
+            if (elapsed >= maxEmptyScanMs) {
+              summary.warnings += 1;
+              addBulkLog(
+                `[关注][WARN] 连续扫描仍未获取到任何评论用户，停止以避免无限滚动 account=${safeString(a.name || a.id)} elapsedSec=${Math.round(elapsed / 1000)} url=${safeString(
+                  commentPage.url(),
+                )}`,
+              );
+              break;
+            }
+
+            // 每 5 轮输出一次轻量诊断，避免用户以为“卡住没做事”
+            if (rounds % 5 === 0) {
+              const diag = await commentPage
+                .evaluate(() => {
+                  const root =
+                    document.querySelector('[data-testid="primaryColumn"]') ||
+                    document.querySelector('main[role="main"]') ||
+                    document.body;
+                  const tweets = root.querySelectorAll('[data-testid="tweet"]').length;
+                  const articles = root.querySelectorAll("article").length;
+                  const userName = root.querySelectorAll('[data-testid="User-Name"]').length;
+                  const userNameLinks = root.querySelectorAll('[data-testid="User-Name"] a[href]').length;
+                  const avatarLinks = root.querySelectorAll('[data-testid="UserAvatar-Container"] a[href]').length;
+                  const statusLinks = root.querySelectorAll('a[href*="/status/"]').length;
+                  return { tweets, articles, userName, userNameLinks, avatarLinks, statusLinks };
+                })
+                .catch(() => null);
+              if (diag && typeof diag === "object") {
+                addBulkLog(
+                  `[关注][DBG] 扫描中 rounds=${rounds} tweets=${Number(diag.tweets || 0)} articles=${Number(diag.articles || 0)} userName=${Number(
+                    diag.userName || 0,
+                  )} userNameLinks=${Number(diag.userNameLinks || 0)} avatarLinks=${Number(diag.avatarLinks || 0)} statusLinks=${Number(
+                    diag.statusLinks || 0,
+                  )}`,
+                );
+              }
+            }
+          }
+
+          if (!emptyDiagLogged && seen.size === 0 && rounds >= 6) {
+            emptyDiagLogged = true;
             const diag = await commentPage
               .evaluate(() => {
-                const root =
-                  document.querySelector('[data-testid="primaryColumn"]') ||
-                  document.querySelector('main[role="main"]') ||
-                  document.body;
-                const tweets = root.querySelectorAll('[data-testid="tweet"]').length;
-                const articles = root.querySelectorAll("article").length;
-                const userName = root.querySelectorAll('[data-testid="User-Name"]').length;
-                const userNameLinks = root.querySelectorAll('[data-testid="User-Name"] a[href]').length;
-                const avatarLinks = root.querySelectorAll('[data-testid="UserAvatar-Container"] a[href]').length;
-                const statusLinks = root.querySelectorAll('a[href*="/status/"]').length;
-                return { tweets, articles, userName, userNameLinks, avatarLinks, statusLinks };
+                const url = location.href || "";
+                const articles = document.querySelectorAll("article").length;
+                const hasPrimary = Boolean(document.querySelector('[data-testid="primaryColumn"]'));
+                const hasMain = Boolean(document.querySelector('main[role="main"]'));
+                return { url, articles, hasPrimary, hasMain };
               })
               .catch(() => null);
             if (diag && typeof diag === "object") {
               addBulkLog(
-                `[关注][DBG] 扫描中 rounds=${rounds} tweets=${Number(diag.tweets || 0)} articles=${Number(diag.articles || 0)} userName=${Number(
-                  diag.userName || 0,
-                )} userNameLinks=${Number(diag.userNameLinks || 0)} avatarLinks=${Number(diag.avatarLinks || 0)} statusLinks=${Number(
-                  diag.statusLinks || 0,
-                )}`,
+                `[关注][DBG] 扫描仍为空：url=${safeString(diag.url)} articles=${Number(diag.articles || 0)} primary=${Boolean(
+                  diag.hasPrimary,
+                )} main=${Boolean(diag.hasMain)}`,
               );
             }
           }
-        }
 
-        if (!emptyDiagLogged && seen.size === 0 && rounds >= 6) {
-          emptyDiagLogged = true;
-          const diag = await commentPage
-            .evaluate(() => {
-              const url = location.href || "";
-              const articles = document.querySelectorAll("article").length;
-              const hasPrimary = Boolean(document.querySelector('[data-testid="primaryColumn"]'));
-              const hasMain = Boolean(document.querySelector('main[role="main"]'));
-              return { url, articles, hasPrimary, hasMain };
-            })
-            .catch(() => null);
-          if (diag && typeof diag === "object") {
-            addBulkLog(
-              `[关注][DBG] 扫描仍为空：url=${safeString(diag.url)} articles=${Number(diag.articles || 0)} primary=${Boolean(
-                diag.hasPrimary,
-              )} main=${Boolean(diag.hasMain)}`,
-            );
-          }
-        }
-
-        // 继续滚动加载更多评论
-        const aggressiveScroll = seen.size === 0 && rounds >= 6;
-        await commentPage.mouse.move(640, 400).catch(() => {});
-        await commentPage.mouse.wheel({ deltaY: randomIntInclusive(650, 980) }).catch(() => {});
-        await commentPage
-          .evaluate((aggressive) => {
-            const delta = Math.floor(window.innerHeight * 0.85);
-            try {
-              window.scrollBy(0, delta);
-            } catch {}
-
-            if (aggressive) {
+          // 继续滚动加载更多评论
+          const aggressiveScroll = seen.size === 0 && rounds >= 6;
+          await commentPage.mouse.move(640, 400).catch(() => {});
+          await commentPage.mouse.wheel({ deltaY: randomIntInclusive(650, 980) }).catch(() => {});
+          await commentPage
+            .evaluate((aggressive) => {
+              const delta = Math.floor(window.innerHeight * 0.85);
               try {
-                window.scrollTo(0, document.body.scrollHeight);
+                window.scrollBy(0, delta);
               } catch {}
-            }
 
-            // 有时滚动容器并不是 window（例如某些布局/嵌套滚动），这里尝试找到可滚动父容器并滚动。
-            try {
-              const primary = document.querySelector('[data-testid="primaryColumn"]');
-              let el = primary || (document.scrollingElement && document.scrollingElement !== document.body ? document.scrollingElement : null);
-              for (let i = 0; i < 8 && el; i += 1) {
-                const style = window.getComputedStyle(el);
-                const canScroll = (style.overflowY === "auto" || style.overflowY === "scroll") && el.scrollHeight > el.clientHeight + 20;
-                if (canScroll) {
-                  el.scrollBy(0, delta);
-                  if (aggressive) {
-                    try {
-                      el.scrollTop = el.scrollHeight;
-                    } catch {}
+              if (aggressive) {
+                try {
+                  window.scrollTo(0, document.body.scrollHeight);
+                } catch {}
+              }
+
+              // 有时滚动容器并不是 window（例如某些布局/嵌套滚动），这里尝试找到可滚动父容器并滚动。
+              try {
+                const primary = document.querySelector('[data-testid="primaryColumn"]');
+                let el = primary || (document.scrollingElement && document.scrollingElement !== document.body ? document.scrollingElement : null);
+                for (let i = 0; i < 8 && el; i += 1) {
+                  const style = window.getComputedStyle(el);
+                  const canScroll = (style.overflowY === "auto" || style.overflowY === "scroll") && el.scrollHeight > el.clientHeight + 20;
+                  if (canScroll) {
+                    el.scrollBy(0, delta);
+                    if (aggressive) {
+                      try {
+                        el.scrollTop = el.scrollHeight;
+                      } catch {}
+                    }
+                    break;
                   }
-                  break;
+                  el = el.parentElement;
                 }
-                el = el.parentElement;
-              }
-            } catch {}
+              } catch {}
 
-            // 有些推文需要点“显示更多回复/Show more replies”才会展开，做一次轻量兜底点击（找不到就算了）。
-            try {
-              const root = document.querySelector('[data-testid="primaryColumn"]') || document.body;
-              const btns = Array.from(root.querySelectorAll('[role="button"], button'));
-              const patterns = [
-                "show more replies",
-                "show replies",
-                "view replies",
-                "view more replies",
-                "more replies",
-                "显示更多回复",
-                "查看更多回复",
-                "展开更多回复",
-                "更多回复",
-                "显示更多",
-                "查看更多",
-              ];
-              let clicked = 0;
-              for (const b of btns) {
-                if (clicked >= 2) break;
-                const text = (b.innerText || b.textContent || "").trim();
-                const aria = (b.getAttribute && b.getAttribute("aria-label") ? String(b.getAttribute("aria-label") || "") : "").trim();
-                const t = `${text} ${aria}`.toLowerCase().trim();
-                if (!t) continue;
-                if (patterns.some((p) => t.includes(p.toLowerCase()))) {
-                  b.click();
-                  clicked += 1;
+              // 有些推文需要点“显示更多回复/Show more replies”才会展开，做一次轻量兜底点击（找不到就算了）。
+              try {
+                const root = document.querySelector('[data-testid="primaryColumn"]') || document.body;
+                const btns = Array.from(root.querySelectorAll('[role="button"], button'));
+                const patterns = [
+                  "show more replies",
+                  "show replies",
+                  "view replies",
+                  "view more replies",
+                  "more replies",
+                  "显示更多回复",
+                  "查看更多回复",
+                  "展开更多回复",
+                  "更多回复",
+                  "显示更多",
+                  "查看更多",
+                ];
+                let clicked = 0;
+                for (const b of btns) {
+                  if (clicked >= 2) break;
+                  const text = (b.innerText || b.textContent || "").trim();
+                  const aria = (b.getAttribute && b.getAttribute("aria-label") ? String(b.getAttribute("aria-label") || "") : "").trim();
+                  const t = `${text} ${aria}`.toLowerCase().trim();
+                  if (!t) continue;
+                  if (patterns.some((p) => t.includes(p.toLowerCase()))) {
+                    b.click();
+                    clicked += 1;
+                  }
                 }
-              }
-            } catch {}
-          }, aggressiveScroll)
-          .catch(() => {});
-        await sleep(randomIntInclusive(700, 1400));
+              } catch {}
+            }, aggressiveScroll)
+            .catch(() => {});
+          await sleep(randomIntInclusive(700, 1400));
 
-        // 评论区已没有新用户了：提前结束
-        if (pending.length === 0 && (noNewRounds >= noNewLimit || seen.size >= maxScanUsers)) {
-          addBulkLog(
-            `[关注] 评论用户已耗尽/无新增，提前结束 account=${safeString(a.name || a.id)} followed=${summary.followed}/${effectiveFollowLimit} scanned=${seen.size}`,
-          );
-          break;
+          // 评论区已没有新用户了：提前结束
+          if (pending.length === 0 && (noNewRounds >= noNewLimit || seen.size >= maxScanUsers)) {
+            addBulkLog(
+              `[关注] 评论用户已耗尽/无新增，提前结束 account=${safeString(a.name || a.id)} followed=${summary.followed}/${effectiveFollowLimit} scanned=${seen.size}`,
+            );
+            break;
+          }
+
+          // 本轮没拿到用户，继续下一轮扫描
+          if (pending.length === 0) continue;
         }
-
-        // 本轮没拿到用户，继续下一轮扫描
-        if (pending.length === 0) continue;
       }
 
       const target = safeString(pending.shift()).trim();
