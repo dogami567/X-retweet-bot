@@ -911,7 +911,7 @@ bind("btnDeleteAccount", "click", async () => {
 });
 
 bind("btnOpenLogin", "click", async () => {
-  const a = getSelectedAccount();
+  let a = getSelectedAccount();
   if (!a) throw new Error("请先选择或创建一个账号");
 
   const btn = byId("btnOpenLogin");
@@ -920,6 +920,12 @@ bind("btnOpenLogin", "click", async () => {
   btn.innerHTML = `<span class="spinner-border spinner-border-sm" role="status" aria-hidden="true"></span> 等待登录...`;
 
   try {
+    // 先保存配置，确保账号/代理等信息已落盘。
+    // 否则“新增账号后直接点登录”，服务端还没这条账号记录，会报“账号未找到”。
+    await saveConfig();
+    a = getSelectedAccount();
+    if (!a) throw new Error("账号保存后未找到，请刷新页面重试");
+
     setJsonBox({
       msg: "正在启动浏览器...\n1. 请在弹出的窗口完成登录（可选 Continue with Google）。\n2. 登录成功后保持在首页，窗口会自动关闭。\n\n提示：不建议在脚本里保存账号密码。",
     });
