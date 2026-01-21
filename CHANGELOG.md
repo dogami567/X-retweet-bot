@@ -1,5 +1,9 @@
 # 更新日志
 
+## v0.3.9 (2026-01-21)
+
+- 修复：浏览器登录在“Continue with Google”等场景下可能一直卡在“等待登录”，改为检测 Cookie（auth_token/ct0）后自动结束并保存 Profile。
+
 ## v0.3.8 (2026-01-21)
 
 - 修复：Release/EXE 打包后 Puppeteer Stealth 子模块缺失导致无法启动浏览器登录（为 pkg 显式打包 `puppeteer-extra-plugin-stealth/evasions`）。

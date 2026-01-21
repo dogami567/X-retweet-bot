@@ -4098,12 +4098,29 @@ async function main() {
             .evaluate(() => {
               return Boolean(
                 document.querySelector('[data-testid="SideNav_AccountSwitcher_Button"]') ||
-                  document.querySelector('[data-testid="SideNav_NewTweet_Button"]'),
+                  document.querySelector('[data-testid="SideNav_NewTweet_Button"]') ||
+                  document.querySelector('[data-testid="AppTabBar_Home_Link"]') ||
+                  document.querySelector('[data-testid="AppTabBar_Profile_Link"]'),
               );
             })
             .catch(() => false);
 
-          if (loggedIn) {
+          // 有些登录方式（例如 Continue with Google）会打开新窗口/新标签页，导致主页面一直停在登录页。
+          // 兜底：只要检测到 auth_token/ct0 等关键 Cookie，就认为已登录并自动关闭窗口。
+          const cookieLoggedIn = loggedIn
+            ? true
+            : await (async () => {
+                try {
+                  const pagesNow = await browser.pages().catch(() => []);
+                  const p = pagesNow[0] || page;
+                  const cookies = await p.cookies("https://x.com", "https://twitter.com").catch(() => []);
+                  return cookies.some((c) => c && (c.name === "auth_token" || c.name === "ct0"));
+                } catch {
+                  return false;
+                }
+              })();
+
+          if (cookieLoggedIn) {
             cleanup();
             resolve({ profileDir: profileDirValue });
           }
