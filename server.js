@@ -1122,6 +1122,23 @@ async function scanVisibleCommenterUsernames(page, excludeAuthor) {
           h = parseHandleFromProfileHref(href);
         }
 
+        // 兜底：某些 UI 结构可能没有 data-testid="User-Name"，再从 article 内挑选“非正文(tweetText)区域”的主页链接
+        // 注意：正文里也可能包含 @ 提及链接，因此这里排除 tweetText 容器，减少误抓概率。
+        if (!h) {
+          try {
+            const links = Array.from(article.querySelectorAll('a[href][role="link"]'));
+            for (const a of links) {
+              if (a.closest('[data-testid="tweetText"]')) continue;
+              const href = a.getAttribute("href") || a.href || "";
+              const hh = parseHandleFromProfileHref(href);
+              if (hh) {
+                h = hh;
+                break;
+              }
+            }
+          } catch {}
+        }
+
         if (!h) continue;
         out.push(h);
       }
@@ -1327,7 +1344,18 @@ async function bulkFollowCommentersForAccount(account, tweetUrl, options = {}) {
         if (added === 0) noNewRounds += 1;
         else noNewRounds = 0;
 
-        const noNewLimit = seen.size === 0 ? 25 : maxNoNewRounds;
+        if (added > 0) {
+          const sample = pending
+            .slice(0, 3)
+            .map((u) => `@${safeString(u)}`)
+            .join(",");
+          addBulkLog(
+            `[关注][DBG] 扫描新增 added=${added} queued=${pending.length} total=${seen.size}${sample ? ` sample=${sample}` : ""}`,
+          );
+        }
+
+        // 首轮/弱网时评论加载可能较慢：seen=0 时多给一些轮次，避免刚开始就判定“无评论”
+        const noNewLimit = seen.size === 0 ? 80 : maxNoNewRounds;
 
         if (!emptyDiagLogged && seen.size === 0 && noNewRounds >= 5) {
           emptyDiagLogged = true;
@@ -1416,6 +1444,7 @@ async function bulkFollowCommentersForAccount(account, tweetUrl, options = {}) {
       }
 
       try {
+        addBulkLog(`[关注] 进入主页 account=${safeString(a.name || a.id)} user=@${username}`);
         await actionPage.bringToFront().catch(() => {});
         await actionPage.goto(profileUrl, { waitUntil: "domcontentloaded", timeout: 60_000 });
       } catch (e) {
