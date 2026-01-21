@@ -1104,7 +1104,8 @@ async function scanVisibleCommenterUsernames(page, excludeAuthor) {
         document.body;
       const out = [];
 
-      const articles = Array.from(root.querySelectorAll("article"));
+      const tweetArticles = Array.from(root.querySelectorAll('article[data-testid="tweet"]'));
+      const articles = tweetArticles.length ? tweetArticles : Array.from(root.querySelectorAll("article"));
       for (const article of articles) {
         // 优先从“时间戳(time)的 status 链接”里解析作者（最稳，且不会误抓正文 @ 提及）
         let h = "";
@@ -1114,6 +1115,15 @@ async function scanVisibleCommenterUsernames(page, excludeAuthor) {
           const href = statusA ? statusA.getAttribute("href") || statusA.href || "" : "";
           h = parseHandleFromStatusHref(href);
         } catch {}
+
+        // 兜底：从 article 内任意 status 链接解析（兼容某些布局 time 不在 a 内/被异步替换）
+        if (!h) {
+          try {
+            const aStatus = article.querySelector('a[href*="/status/"]');
+            const href = aStatus ? aStatus.getAttribute("href") || aStatus.href || "" : "";
+            h = parseHandleFromStatusHref(href);
+          } catch {}
+        }
 
         // 兜底：再从“作者区”的主页链接解析（避免误抓正文 @ 提及链接）
         if (!h) {
@@ -1294,6 +1304,67 @@ async function bulkFollowCommentersForAccount(account, tweetUrl, options = {}) {
     const maxFollow = Math.max(1, Math.round(Number(options.maxFollow || 0) || 1));
     const effectiveFollowLimit = Math.max(1, Math.min(remainDaily || maxFollow, maxFollow));
     const authorFromUrl = extractStatusAuthorFromUrl(tweetUrl);
+    let excludeAuthor = authorFromUrl;
+    if (!excludeAuthor) {
+      excludeAuthor = await commentPage
+        .evaluate(() => {
+          const root =
+            document.querySelector('[data-testid="primaryColumn"]') ||
+            document.querySelector('main[role="main"]') ||
+            document.body;
+          const article = root.querySelector('article[data-testid="tweet"]') || root.querySelector("article");
+          if (!article) return "";
+
+          const normalizePathname = (href) => {
+            if (!href || typeof href !== "string") return "";
+            try {
+              return new URL(href, location.origin).pathname || "";
+            } catch {
+              return String(href || "");
+            }
+          };
+
+          const parseStatus = (href) => {
+            const pathname = normalizePathname(href);
+            const m = pathname.match(/^\/([^\/?#]+)\/status\/\d+/i);
+            if (!m) return "";
+            const h = String(m[1] || "").trim();
+            return /^[A-Za-z0-9_]{1,50}$/.test(h) ? h : "";
+          };
+
+          const parseProfile = (href) => {
+            const pathname = normalizePathname(href);
+            if (!pathname.startsWith("/")) return "";
+            if (pathname.startsWith("/i/")) return "";
+            if (pathname.includes("/status/")) return "";
+            const clean = pathname.replace(/\/+$/g, "");
+            const parts = clean.split("/").filter(Boolean);
+            if (parts.length !== 1) return "";
+            const h = parts[0];
+            return /^[A-Za-z0-9_]{1,50}$/.test(h) ? h : "";
+          };
+
+          // 优先从 time/status 链接拿作者
+          try {
+            const timeEl = article.querySelector("time");
+            const a = timeEl ? timeEl.closest("a[href]") : null;
+            const href = a ? a.getAttribute("href") || a.href || "" : "";
+            const h = parseStatus(href);
+            if (h) return h;
+          } catch {}
+
+          // 兜底：作者区主页链接
+          try {
+            const a = article.querySelector('[data-testid="User-Name"] a[href]');
+            const href = a ? a.getAttribute("href") || a.href || "" : "";
+            const h = parseProfile(href);
+            if (h) return h;
+          } catch {}
+
+          return "";
+        })
+        .catch(() => "");
+    }
 
     // 逐步扫描评论用户 + 逐个进入关注：避免先把大量评论用户全部收集完（大帖会很慢）
     const maxRounds = 260;
@@ -1305,6 +1376,7 @@ async function bulkFollowCommentersForAccount(account, tweetUrl, options = {}) {
     let noNewRounds = 0;
     let rounds = 0;
     let emptyDiagLogged = false;
+    let lastTweetCount = 0;
 
     const enqueueHandles = (items) => {
       let added = 0;
@@ -1339,7 +1411,7 @@ async function bulkFollowCommentersForAccount(account, tweetUrl, options = {}) {
           break;
         }
 
-        const found = await scanVisibleCommenterUsernames(commentPage, authorFromUrl);
+        const found = await scanVisibleCommenterUsernames(commentPage, excludeAuthor);
         const added = enqueueHandles(found);
         if (added === 0) noNewRounds += 1;
         else noNewRounds = 0;
@@ -1357,7 +1429,23 @@ async function bulkFollowCommentersForAccount(account, tweetUrl, options = {}) {
         // 首轮/弱网时评论加载可能较慢：seen=0 时多给一些轮次，避免刚开始就判定“无评论”
         const noNewLimit = seen.size === 0 ? 80 : maxNoNewRounds;
 
-        if (!emptyDiagLogged && seen.size === 0 && noNewRounds >= 5) {
+        const tweetCountNow = await commentPage
+          .evaluate(() => {
+            const root =
+              document.querySelector('[data-testid="primaryColumn"]') ||
+              document.querySelector('main[role="main"]') ||
+              document.body;
+            const n = root.querySelectorAll('article[data-testid="tweet"]').length;
+            return Number(n || 0);
+          })
+          .catch(() => 0);
+        if (tweetCountNow > lastTweetCount) {
+          lastTweetCount = tweetCountNow;
+          // 即使暂时没扫到新用户名，只要页面内容还在增长，就不要过快触发“无新增”提前结束
+          if (added === 0) noNewRounds = 0;
+        }
+
+        if (!emptyDiagLogged && seen.size === 0 && rounds >= 6) {
           emptyDiagLogged = true;
           const diag = await commentPage
             .evaluate(() => {
@@ -1378,14 +1466,21 @@ async function bulkFollowCommentersForAccount(account, tweetUrl, options = {}) {
         }
 
         // 继续滚动加载更多评论
+        const aggressiveScroll = seen.size === 0 && rounds >= 6;
         await commentPage.mouse.move(640, 400).catch(() => {});
         await commentPage.mouse.wheel({ deltaY: randomIntInclusive(650, 980) }).catch(() => {});
         await commentPage
-          .evaluate(() => {
+          .evaluate((aggressive) => {
             const delta = Math.floor(window.innerHeight * 0.85);
             try {
               window.scrollBy(0, delta);
             } catch {}
+
+            if (aggressive) {
+              try {
+                window.scrollTo(0, document.body.scrollHeight);
+              } catch {}
+            }
 
             // 有时滚动容器并不是 window（例如某些布局/嵌套滚动），这里尝试找到可滚动父容器并滚动。
             try {
@@ -1396,6 +1491,11 @@ async function bulkFollowCommentersForAccount(account, tweetUrl, options = {}) {
                 const canScroll = (style.overflowY === "auto" || style.overflowY === "scroll") && el.scrollHeight > el.clientHeight + 20;
                 if (canScroll) {
                   el.scrollBy(0, delta);
+                  if (aggressive) {
+                    try {
+                      el.scrollTop = el.scrollHeight;
+                    } catch {}
+                  }
                   break;
                 }
                 el = el.parentElement;
@@ -1405,19 +1505,34 @@ async function bulkFollowCommentersForAccount(account, tweetUrl, options = {}) {
             // 有些推文需要点“显示更多回复/Show more replies”才会展开，做一次轻量兜底点击（找不到就算了）。
             try {
               const root = document.querySelector('[data-testid="primaryColumn"]') || document.body;
-              const btns = Array.from(root.querySelectorAll('[role="button"]'));
-              const patterns = ["show more replies", "show replies", "显示更多回复", "查看更多回复", "展开更多回复"];
+              const btns = Array.from(root.querySelectorAll('[role="button"], button'));
+              const patterns = [
+                "show more replies",
+                "show replies",
+                "view replies",
+                "view more replies",
+                "more replies",
+                "显示更多回复",
+                "查看更多回复",
+                "展开更多回复",
+                "更多回复",
+                "显示更多",
+                "查看更多",
+              ];
+              let clicked = 0;
               for (const b of btns) {
+                if (clicked >= 2) break;
                 const text = (b.innerText || b.textContent || "").trim();
-                if (!text) continue;
-                const t = text.toLowerCase();
+                const aria = (b.getAttribute && b.getAttribute("aria-label") ? String(b.getAttribute("aria-label") || "") : "").trim();
+                const t = `${text} ${aria}`.toLowerCase().trim();
+                if (!t) continue;
                 if (patterns.some((p) => t.includes(p.toLowerCase()))) {
                   b.click();
-                  break;
+                  clicked += 1;
                 }
               }
             } catch {}
-          })
+          }, aggressiveScroll)
           .catch(() => {});
         await sleep(randomIntInclusive(700, 1400));
 
