@@ -43,8 +43,11 @@ jobs:
       - name: Install
         run: npm ci
 
-      - name: Build EXE + ZIP
-        run: npm run release:exe
+      - name: Build EXE
+        run: npm run build:exe
+
+      - name: Package ZIP
+        run: npm run package:exe
 
       - name: Rename artifact
         shell: pwsh
