@@ -1,0 +1,57 @@
+name: cleanup-releases
+
+on:
+  push:
+    tags:
+      - "cleanup-releases-*"
+
+permissions:
+  contents: write
+
+jobs:
+  delete-old-releases:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Delete releases v0.3.11 ~ v0.3.18
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          echo "Repo: $REPO"
+          echo "Deleting GitHub Releases for tags: v0.3.11 ~ v0.3.18 (inclusive)"
+
+          deleted=0
+          page=1
+
+          while true; do
+            json="$(curl -sSf \
+              -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              "https://api.github.com/repos/$REPO/releases?per_page=100&page=$page")"
+
+            count="$(echo "$json" | jq 'length')"
+            if [ "$count" -eq 0 ]; then
+              break
+            fi
+
+            while IFS=$'\t' read -r id tag name; do
+              if [ -z "${id:-}" ] || [ -z "${tag:-}" ]; then
+                continue
+              fi
+              echo "Deleting release: id=$id tag=$tag name=$name"
+              curl -sSf -X DELETE \
+                -H "Authorization: Bearer $GH_TOKEN" \
+                -H "Accept: application/vnd.github+json" \
+                -H "X-GitHub-Api-Version: 2022-11-28" \
+                "https://api.github.com/repos/$REPO/releases/$id" >/dev/null
+              deleted=$((deleted + 1))
+            done < <(echo "$json" | jq -r '.[] | select(.tag_name | test("^v0\\.3\\.(1[1-8])$")) | [.id, .tag_name, (.name // "")] | @tsv')
+
+            page=$((page + 1))
+          done
+
+          echo "Done. Deleted releases: $deleted"
