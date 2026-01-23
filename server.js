@@ -1017,6 +1017,29 @@ function setBulkFollowStopRequested() {
   bulkFollowJob.stopRequested = true;
 }
 
+function isChromeUserDataDirInUseError(err) {
+  const msg = safeString(err?.message || err);
+  const t = msg.toLowerCase();
+  return (
+    t.includes("the browser is already running for") ||
+    t.includes("user data directory is already in use") ||
+    t.includes("profile is already in use") ||
+    t.includes("process singleton") ||
+    t.includes("singletonlock")
+  );
+}
+
+async function cleanupChromeProfileLocks(profileDir) {
+  const dir = safeString(profileDir).trim();
+  if (!dir) return;
+  const names = ["SingletonLock", "SingletonCookie", "SingletonSocket"];
+  for (const name of names) {
+    const p = path.join(dir, name);
+    // eslint-disable-next-line no-await-in-loop
+    await fs.unlink(p).catch(() => {});
+  }
+}
+
 async function collectCommenterUsernames(page, options = {}) {
   const opt = options && typeof options === "object" ? options : {};
   const maxUsers = Math.max(50, Math.min(5000, Math.round(Number(opt.maxUsers) || 500)));
@@ -5173,18 +5196,18 @@ async function main() {
 
     console.log(`[Login] Launching browser: ${exe} profile=${profileDir}`);
 
+    const args = [
+      "--disable-blink-features=AutomationControlled",
+      "--no-first-run",
+      "--no-default-browser-check",
+      "--disable-infobars",
+      "--window-position=0,0",
+      "--window-size=1280,800",
+    ];
+    if (proxyUrl) args.push(`--proxy-server=${proxyUrl}`);
+
     let browser;
     try {
-      const args = [
-        "--disable-blink-features=AutomationControlled",
-        "--no-first-run",
-        "--no-default-browser-check",
-        "--disable-infobars",
-        "--window-position=0,0",
-        "--window-size=1280,800",
-      ];
-      if (proxyUrl) args.push(`--proxy-server=${proxyUrl}`);
-
       browser = await puppeteer.launch({
         executablePath: exe,
         headless: false,
@@ -5194,7 +5217,33 @@ async function main() {
         args,
       });
     } catch (e) {
-      throw new Error(`启动浏览器失败: ${e.message}`);
+      // 常见：用户重复点击“打开浏览器登录”，或上一轮登录窗口还没关，导致 profile 被占用。
+      // 这种情况不要直接报“失败”，而是提示用户去已打开的窗口完成登录。
+      if (isChromeUserDataDirInUseError(e)) {
+        await cleanupChromeProfileLocks(profileDir);
+
+        try {
+          browser = await puppeteer.launch({
+            executablePath: exe,
+            headless: false,
+            defaultViewport: null,
+            userDataDir: profileDir,
+            ignoreDefaultArgs: ["--enable-automation"],
+            args,
+          });
+        } catch (e2) {
+          // 兜底：尝试唤起/打开登录页（若该 Profile 的浏览器确实已在运行，Chrome 会复用已有进程）
+          try {
+            spawn(exe, [...args, `--user-data-dir=${profileDir}`, "https://x.com/i/flow/login"], {
+              detached: true,
+              stdio: "ignore",
+            }).unref();
+          } catch {}
+          return { profileDir: profileDirValue, alreadyRunning: true };
+        }
+      } else {
+        throw new Error(`启动浏览器失败: ${safeString(e?.message || e)}`);
+      }
     }
 
     const pages = await browser.pages();
@@ -5295,6 +5344,12 @@ async function main() {
       if (!acc) throw new Error("账号未找到");
       if (!acc.x) acc.x = {};
 
+      // 避免“任务运行中又点登录”导致 Profile 冲突
+      const st = upsertBulkState(acc.id);
+      if (st && (st.running || st.followRunning)) {
+        return res.status(409).json({ error: "该账号正在执行任务（发帖/关注），请先停止或等待结束后再登录" });
+      }
+
       // 若未设置，则为该账号分配一个默认 Profile 目录（相对 APP_DIR）
       if (!safeString(acc.x.profileDir).trim()) {
         acc.x.profileDir = defaultBulkBrowserProfileDirValue(acc.id);
@@ -5309,6 +5364,16 @@ async function main() {
 
       ensureBulkAccountIds(bulkConfig);
       await writeJson(BULK_CONFIG_PATH, bulkConfig);
+
+      if (result?.alreadyRunning) {
+        addBulkLog(`[登录][WARN] 浏览器已在运行：account=${safeString(acc.name || acc.id)} dir=${safeString(acc.x.profileDir)}`);
+        return res.json({
+          ok: true,
+          alreadyRunning: true,
+          msg: "检测到该账号的浏览器窗口已在运行：请切换到已打开的 Chrome/Edge 窗口完成登录（完成后可关闭窗口），然后刷新页面即可。",
+          profileDir: acc.x.profileDir,
+        });
+      }
 
       addBulkLog(`[登录] 已保存浏览器 Profile：account=${safeString(acc.name || acc.id)} dir=${safeString(acc.x.profileDir)}`);
       return res.json({ ok: true, msg: "登录完成，已保存 Profile（后续发帖将复用）", profileDir: acc.x.profileDir });
@@ -5343,6 +5408,16 @@ async function main() {
       configFile = next;
       await writeJson(CONFIG_PATH, configFile);
       config = applyEnvOverrides(configFile);
+
+      if (result?.alreadyRunning) {
+        addLog(`[登录][WARN] 浏览器已在运行：dir=${safeString(next.forward.x.profileDir)}`);
+        return res.json({
+          ok: true,
+          alreadyRunning: true,
+          msg: "检测到浏览器窗口已在运行：请切换到已打开的 Chrome/Edge 窗口完成登录（完成后可关闭窗口），然后刷新页面即可。",
+          profileDir: next.forward.x.profileDir,
+        });
+      }
 
       addLog(`[登录] 已保存浏览器 Profile：dir=${safeString(next.forward.x.profileDir)}`);
       return res.json({ ok: true, msg: "登录完成，已保存 Profile（转发/发帖将复用）", profileDir: next.forward.x.profileDir });
