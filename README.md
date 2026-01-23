@@ -41,7 +41,9 @@
 4. **添加账号并登录**：
    - 左侧「账号管理」点 `+` 新建账号
    - 在「浏览器登录」点击「打开浏览器登录」，在弹出的 Chrome/Edge 窗口完成登录（可选 Continue with Google）
-   - 登录成功后，Profile 会保存到 `data/browser-profiles/<账号id>`，下次无需重复登录
+   - 登录成功后会保存浏览器 Profile（下次无需重复登录）：
+     - 开发模式（npm）：默认在 `data/browser-profiles/<账号id>`
+     - EXE 模式：默认在用户本地目录（`%LOCALAPPDATA%\\X-get2put\\browser-profiles\\<账号id>`），更稳也更适合虚拟机/共享目录场景
 5. **设置调度策略**：
    - 基础间隔（分）+ 随机抖动（±分）
    - 图片数量（Min/Max），每次会在范围内随机选取（最多 4 张）
@@ -119,6 +121,15 @@
 3. 在网页“配置”里填写并保存：`twitterapi.io API Key` +（可选）`X 官方 4 个 Token`（以及可选代理）
 
 提示：如 `3000` 端口被占用，程序会自动换到下一个可用端口；以控制台输出的 `Server listening on http://localhost:XXXX` 为准。
+
+### Windows 虚拟机（macOS 上跑 Windows）
+
+如果你在 Parallels/VMware 等虚拟机里运行，且 Windows 的「桌面/Desktop」被映射为 macOS 共享目录，Chrome 的 Profile 锁文件可能异常，导致“Profile 已在运行”的报错。
+
+建议：
+
+- 解压/运行目录不要放在共享桌面/网盘目录，换到纯本地盘（例如 `C:\\X-get2put\\`）。
+- 新版 exe 会默认把浏览器 Profile 放在本机 `AppData`（更稳），也可通过环境变量 `XGET2PUT_PROFILE_DIR` 指定 Profile 存放路径。
 
 ## 准备工作（三大块）
 1. 获取监控用的 Key (twitterapi.io)

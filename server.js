@@ -1,5 +1,6 @@
 const fs = require("node:fs/promises");
 const fssync = require("node:fs");
+const os = require("node:os");
 const path = require("node:path");
 const { spawn, execSync } = require("node:child_process");
 
@@ -138,8 +139,25 @@ function sanitizeDirName(name) {
   return s.replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, 120);
 }
 
+function resolveDefaultBrowserProfilesRootDir() {
+  const override = safeString(process.env.XGET2PUT_PROFILE_DIR || process.env.XGET2PUT_BROWSER_PROFILES_DIR).trim();
+  if (override) return path.isAbsolute(override) ? override : path.resolve(APP_DIR, override);
+
+  const home = os.homedir();
+  if (process.platform === "win32") {
+    const localAppData = safeString(process.env.LOCALAPPDATA).trim() || path.join(home, "AppData", "Local");
+    return path.join(localAppData, "X-get2put", "browser-profiles");
+  }
+  if (process.platform === "darwin") {
+    return path.join(home, "Library", "Application Support", "X-get2put", "browser-profiles");
+  }
+  return path.join(home, ".x-get2put", "browser-profiles");
+}
+
 function defaultBulkBrowserProfileDirValue(accountId) {
   const id = sanitizeDirName(accountId) || "acc";
+  // exe 模式下，默认把 Profile 放到用户的本地目录（避免运行目录是共享盘/桌面映射时锁文件异常）
+  if (process.pkg) return path.join(resolveDefaultBrowserProfilesRootDir(), id);
   return path.join("data", "browser-profiles", id);
 }
 
@@ -5186,8 +5204,8 @@ async function main() {
 
     const a = account && typeof account === "object" ? account : null;
     const accountId = safeString(a?.id).trim() || "acc";
-    const profileDirValue = safeString(a?.x?.profileDir).trim() || defaultBulkBrowserProfileDirValue(accountId);
-    const profileDir = resolveAppDirPath(profileDirValue);
+    let profileDirValue = safeString(a?.x?.profileDir).trim() || defaultBulkBrowserProfileDirValue(accountId);
+    let profileDir = resolveAppDirPath(profileDirValue);
 
     if (!profileDir) throw new Error("Profile 目录解析失败");
     await fs.mkdir(profileDir, { recursive: true });
@@ -5232,6 +5250,34 @@ async function main() {
             args,
           });
         } catch (e2) {
+          // mac 上的 Windows 虚拟机（Parallels/VMware）经常把 Desktop 映射成共享目录，
+          // 共享目录的文件锁语义不完整，会导致 Chrome 误判 Profile “已在运行”。
+          // 对历史配置里的默认相对路径（data/browser-profiles/...）做一次自动迁移：改用本地 AppData 目录重新启动。
+          const isDefaultRelativeProfile = /^data[\\/]+browser-profiles[\\/]+/i.test(profileDirValue);
+          if (process.pkg && isDefaultRelativeProfile) {
+            const altValue = defaultBulkBrowserProfileDirValue(accountId);
+            const altDir = resolveAppDirPath(altValue);
+            if (altDir && altDir !== profileDir) {
+              await fs.mkdir(altDir, { recursive: true }).catch(() => {});
+              await cleanupChromeProfileLocks(altDir);
+              try {
+                browser = await puppeteer.launch({
+                  executablePath: exe,
+                  headless: false,
+                  defaultViewport: null,
+                  userDataDir: altDir,
+                  ignoreDefaultArgs: ["--enable-automation"],
+                  args,
+                });
+                profileDirValue = altValue;
+                profileDir = altDir;
+              } catch {}
+            }
+          }
+
+          if (browser) {
+            // 已在“迁移目录”里成功启动浏览器，继续走后续登录流程
+          } else {
           // 兜底：尝试唤起/打开登录页（若该 Profile 的浏览器确实已在运行，Chrome 会复用已有进程）
           try {
             spawn(exe, [...args, `--user-data-dir=${profileDir}`, "https://x.com/i/flow/login"], {
@@ -5240,6 +5286,7 @@ async function main() {
             }).unref();
           } catch {}
           return { profileDir: profileDirValue, alreadyRunning: true };
+          }
         }
       } else {
         throw new Error(`启动浏览器失败: ${safeString(e?.message || e)}`);
