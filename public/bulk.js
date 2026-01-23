@@ -59,7 +59,7 @@ function isLikelyImageFile(file) {
   return isImageName(f.name);
 }
 
-let config = { version: 1, imageDir: "", scanIntervalSec: 3600, captions: [], accounts: [] };
+let config = { version: 1, imageDir: "", scanIntervalSec: 3600, followWaitSec: 18, followConcurrency: 1, followJitterSec: 4, captions: [], accounts: [] };
 let selectedAccountId = "";
 let selectedCaptionIndex = -1;
 let uploadPreviewObjectUrls = [];
@@ -205,11 +205,20 @@ function applyAccountFormToConfig() {
 function applyBaseFormToConfig() {
   config.imageDir = byId("imageDir").value.trim();
   config.scanIntervalSec = Number(byId("scanIntervalSec").value || 3600);
+  config.followWaitSec = Number(byId("followWaitSec")?.value || 18);
+  config.followConcurrency = Number(byId("followConcurrency")?.value || 1);
+  config.followJitterSec = Number(byId("followJitterSec")?.value || 4);
 }
 
 function renderBaseForm() {
   byId("imageDir").value = config.imageDir || "";
   byId("scanIntervalSec").value = String(config.scanIntervalSec ?? 3600);
+  const followWaitEl = byId("followWaitSec");
+  if (followWaitEl) followWaitEl.value = String(config.followWaitSec ?? 18);
+  const followConcEl = byId("followConcurrency");
+  if (followConcEl) followConcEl.value = String(config.followConcurrency ?? 1);
+  const followJitterEl = byId("followJitterSec");
+  if (followJitterEl) followJitterEl.value = String(config.followJitterSec ?? 4);
 }
 
 function renderCaptionList() {
@@ -330,6 +339,9 @@ async function loadConfig() {
   config = res?.config || config;
   if (!Array.isArray(config.accounts)) config.accounts = [];
   if (!Array.isArray(config.captions)) config.captions = [];
+  if (!Number.isFinite(Number(config.followWaitSec))) config.followWaitSec = 18;
+  if (!Number.isFinite(Number(config.followConcurrency))) config.followConcurrency = 1;
+  if (!Number.isFinite(Number(config.followJitterSec))) config.followJitterSec = 4;
 
   renderBaseForm();
   renderCaptionList();
@@ -345,6 +357,9 @@ async function saveConfig() {
   config = res?.config || config;
   if (!Array.isArray(config.accounts)) config.accounts = [];
   if (!Array.isArray(config.captions)) config.captions = [];
+  if (!Number.isFinite(Number(config.followWaitSec))) config.followWaitSec = 18;
+  if (!Number.isFinite(Number(config.followConcurrency))) config.followConcurrency = 1;
+  if (!Number.isFinite(Number(config.followJitterSec))) config.followJitterSec = 4;
   renderBaseForm();
   renderCaptionList();
   renderAccountsList();
@@ -390,6 +405,9 @@ function setFollowJobHint(job) {
   const stopRequested = Boolean(j.stopRequested);
   const url = String(j.tweetUrl || "").trim();
   const maxPerAccount = Number(j.maxPerAccount ?? 0);
+  const followWaitSec = Number(j.followWaitSec ?? 0);
+  const followConcurrency = Number(j.followConcurrency ?? 0);
+  const followJitterSec = Number(j.followJitterSec ?? 0);
   const startedAt = j.startedAt ? new Date(j.startedAt).toLocaleString() : "";
   const finishedAt = j.finishedAt ? new Date(j.finishedAt).toLocaleString() : "";
 
@@ -397,14 +415,20 @@ function setFollowJobHint(job) {
     const total = Number(j.accountsTotal ?? 0);
     const done = Number(j.accountsDone ?? 0);
     const status = stopRequested ? "运行中（已请求停止）" : "运行中";
+    const concText = followConcurrency > 0 ? ` | 并行：${followConcurrency}` : "";
+    const jitterText = followJitterSec > 0 ? ` | 抖动：${followJitterSec}s` : "";
     const limitText = maxPerAccount > 0 ? ` | 本次每号上限：${maxPerAccount}` : "";
-    el.textContent = `状态：${status} | 进度：${done}/${total}${limitText} | 开始：${startedAt || "-"}`;
+    const waitText = followWaitSec > 0 ? ` | 等待按钮：${followWaitSec}s` : "";
+    el.textContent = `状态：${status} | 进度：${done}/${total}${concText}${jitterText}${limitText}${waitText} | 开始：${startedAt || "-"}`;
     return;
   }
 
   if (finishedAt) {
+    const concText = followConcurrency > 0 ? ` | 并行：${followConcurrency}` : "";
+    const jitterText = followJitterSec > 0 ? ` | 抖动：${followJitterSec}s` : "";
     const limitText = maxPerAccount > 0 ? ` | 本次每号上限：${maxPerAccount}` : "";
-    el.textContent = `状态：已结束 | 结束：${finishedAt}${limitText} | 链接：${url || "-"}`;
+    const waitText = followWaitSec > 0 ? ` | 等待按钮：${followWaitSec}s` : "";
+    el.textContent = `状态：已结束 | 结束：${finishedAt}${concText}${jitterText}${limitText}${waitText} | 链接：${url || "-"}`;
     return;
   }
 
@@ -419,9 +443,12 @@ async function followCommentersStart() {
   if (!tweetUrl) throw new Error("请先填写 X 帖子链接");
 
   const maxPerAccount = Number(byId("followMaxPerAccount")?.value || 30);
+  const followWaitSec = Number(byId("followWaitSec")?.value || 18);
+  const followConcurrency = Number(byId("followConcurrency")?.value || 1);
+  const followJitterSec = Number(byId("followJitterSec")?.value || 4);
   const res = await api("/api/bulk/follow-commenters/start", {
     method: "POST",
-    body: JSON.stringify({ tweetUrl, maxPerAccount }),
+    body: JSON.stringify({ tweetUrl, maxPerAccount, followWaitSec, followConcurrency, followJitterSec }),
   });
   setJsonBox(res);
   setFollowJobHint(res?.job || res?.followJob || null);

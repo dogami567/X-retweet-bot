@@ -7,7 +7,7 @@
   "scripts": {
     "start": "node server.js",
     "dev": "node --watch server.js",
-    "build:exe": "pkg server.js --config package.json --targets node18-win-x64 --output dist-exe/X-get2put.exe",
+    "build:exe": "pkg server.js --config package.json --targets node18-win-x64 --output dist-exe/X-get2put.exe --public",
     "package:exe": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/package-exe.ps1",
     "release:exe": "npm run build:exe && npm run package:exe",
     "core-test": "node scripts/core-test.mjs",
