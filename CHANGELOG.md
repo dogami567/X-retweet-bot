@@ -1,5 +1,13 @@
 # 更新日志
 
+## v0.3.22 (2026-01-24)
+
+- 批量关注：支持 URL 队列持续运行（队列轮转）、运行中追加链接、空队列/无新增时 idle、日上限等待到次日。
+- 批量关注：新增关注节奏配置：关注后间隔（秒）、每成功关注 N 个后冷却、冷却时长（秒）。
+- UI：关注评论用户卡片升级为多行 URL 队列输入 + 队列摘要展示 + 参数布局更规整。
+- 状态：`/api/bulk/follow-commenters/status` 增加 currentAccount/currentUrl/sleepRemainingSec/cooldownRemainingSec，便于展示运行进度。
+- 测试：新增 `scripts/follow-queue-smoke.mjs`（空队列启动/stop/状态字段/非法 URL 400）。
+
 ## v0.3.21 (2026-01-23)
 
 - UI：批量面板中带说明文本（form-text）的表单不再“底部对齐”导致输入框错位。
