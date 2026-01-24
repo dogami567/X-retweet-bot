@@ -987,6 +987,33 @@ function isLikelyXStatusUrl(statusUrl) {
   return /x\.com\/[^\/?#]+\/status\/\d+/i.test(u) || /x\.com\/i\/status\/\d+/i.test(u);
 }
 
+function parseXStatusUrlsInput(input) {
+  const rawItems = [];
+  if (Array.isArray(input)) rawItems.push(...input);
+  else if (typeof input === "string") rawItems.push(...input.split(/[\r\n,]+/g));
+  else if (input && typeof input === "object") {
+    if (Array.isArray(input.urls)) rawItems.push(...input.urls);
+    else if (typeof input.urls === "string") rawItems.push(...input.urls.split(/[\r\n,]+/g));
+  }
+
+  const cleaned = rawItems.map((s) => safeString(s).trim()).filter(Boolean);
+  const valid = [];
+  const invalid = [];
+  const seen = new Set();
+  for (const item of cleaned) {
+    const u = normalizeXStatusUrl(item);
+    if (!isLikelyXStatusUrl(u)) {
+      invalid.push(item);
+      continue;
+    }
+    if (seen.has(u)) continue;
+    seen.add(u);
+    valid.push(u);
+    if (valid.length >= 2000) break;
+  }
+  return { valid, invalid };
+}
+
 function isLoginLikeUrl(url) {
   const u = safeString(url).toLowerCase();
   return u.includes("/login") || u.includes("/i/flow/login");
@@ -2596,6 +2623,44 @@ async function runBulkFollowCommenters(tweetUrl, options = {}) {
   }
 }
 
+async function appendBulkFollowUrls(urlsOrText) {
+  const parsed = parseXStatusUrlsInput(urlsOrText);
+  if (parsed.invalid.length > 0) {
+    return {
+      ok: false,
+      error: `存在非法链接（必须包含 /status/）：${parsed.invalid.slice(0, 10).join(", ")}${parsed.invalid.length > 10 ? " ..." : ""}`,
+      invalid: parsed.invalid,
+    };
+  }
+  if (parsed.valid.length === 0) {
+    return {
+      ok: false,
+      error: "未解析到有效推文链接（必须包含 /status/）",
+      invalid: [],
+    };
+  }
+
+  const existing = Array.isArray(bulkConfig?.followUrls) ? bulkConfig.followUrls : [];
+  const seen = new Set(existing);
+  const next = [...existing];
+  let added = 0;
+  for (const u of parsed.valid) {
+    if (seen.has(u)) continue;
+    seen.add(u);
+    next.push(u);
+    added += 1;
+    if (next.length >= 2000) break;
+  }
+
+  if (!bulkConfigFile || typeof bulkConfigFile !== "object") bulkConfigFile = defaultBulkConfig();
+  bulkConfigFile.followUrls = next;
+  await writeJson(BULK_CONFIG_PATH, bulkConfigFile);
+  bulkConfig = normalizeBulkConfig(bulkConfigFile);
+  bulkFollowUrlsUpdatedAt = nowIso();
+
+  return { ok: true, added, total: bulkConfig.followUrls.length, urls: bulkConfig.followUrls };
+}
+
 function normalizeBulkConfig(raw) {
   const next = raw && typeof raw === "object" ? JSON.parse(JSON.stringify(raw)) : defaultBulkConfig();
   if (!next || typeof next !== "object") return defaultBulkConfig();
@@ -3429,6 +3494,7 @@ let bulkFollowJob = {
   accountsDone: 0,
 };
 let bulkFollowStopRequested = false;
+let bulkFollowUrlsUpdatedAt = "";
 let bulkScanTimer = null;
 let bulkImagesCache = { dir: "", images: [], scannedAt: "" };
 let bulkImageWatcher = null;
@@ -4448,6 +4514,7 @@ async function main() {
     await writeJson(BULK_CONFIG_PATH, bulkConfigFile);
   }
   bulkConfig = normalizeBulkConfig(bulkConfigFile);
+  bulkFollowUrlsUpdatedAt = nowIso();
 
   const app = express();
   app.use(cors());
@@ -4915,6 +4982,7 @@ async function main() {
       bulkConfigFile = ensured2.config;
       await writeJson(BULK_CONFIG_PATH, bulkConfigFile);
       bulkConfig = normalizeBulkConfig(bulkConfigFile);
+      bulkFollowUrlsUpdatedAt = nowIso();
       startBulkImageWatcher();
 
       addBulkLog("[配置] 已保存");
@@ -5025,10 +5093,27 @@ async function main() {
   });
 
   // 关注某条推文下的评论用户（按账号执行，复用浏览器 Profile 登录态）
+  app.post("/api/bulk/follow-urls/add", async (req, res) => {
+    try {
+      const input =
+        Array.isArray(req.body) || typeof req.body === "string"
+          ? req.body
+          : req.body?.urls ?? req.body?.text ?? req.body?.value ?? req.body?.raw ?? "";
+
+      const r = await appendBulkFollowUrls(input);
+      if (!r.ok) return res.status(400).json({ error: safeString(r.error), invalid: (r.invalid || []).slice(0, 50) });
+
+      addBulkLog(`[关注] 已追加 URL 队列 added=${r.added} total=${r.total}`);
+      return res.json({ ok: true, added: r.added, total: r.total, urls: r.urls, updatedAt: bulkFollowUrlsUpdatedAt });
+    } catch (e) {
+      const err = safeString(e?.message || e);
+      addBulkLog(`[关注] 追加 URL 失败：${err}`);
+      return res.status(500).json({ error: err });
+    }
+  });
+
   app.post("/api/bulk/follow-commenters/start", async (req, res) => {
     try {
-      const tweetUrl = safeString(req.body?.tweetUrl).trim();
-      if (!tweetUrl) return res.status(400).json({ error: "缺少 tweetUrl" });
       const maxPerAccount = Math.round(Number(req.body?.maxPerAccount) || 30);
       const followWaitSec = req.body?.followWaitSec;
       const followConcurrency = req.body?.followConcurrency;
@@ -5036,8 +5121,20 @@ async function main() {
 
       if (bulkFollowJob?.running) return res.status(409).json({ error: "关注任务正在运行中" });
 
-      const url = normalizeXStatusUrl(tweetUrl);
-      if (!isLikelyXStatusUrl(url)) return res.status(400).json({ error: "链接不合法：请提供 X 推文链接（包含 /status/）" });
+      const tweetUrlRaw = safeString(req.body?.tweetUrl).trim();
+      let url = "";
+      if (tweetUrlRaw) {
+        url = normalizeXStatusUrl(tweetUrlRaw);
+        if (!isLikelyXStatusUrl(url)) return res.status(400).json({ error: "链接不合法：请提供 X 推文链接（包含 /status/）" });
+
+        // 传 tweetUrl 等价于“先追加到队列，再启动”
+        const addRes = await appendBulkFollowUrls([url]);
+        if (!addRes.ok) return res.status(400).json({ error: safeString(addRes.error), invalid: (addRes.invalid || []).slice(0, 50) });
+      } else {
+        const first = Array.isArray(bulkConfig?.followUrls) ? safeString(bulkConfig.followUrls[0]).trim() : "";
+        if (!first) return res.status(400).json({ error: "缺少 tweetUrl，且 URL 队列为空：请先追加链接或直接填写链接启动" });
+        url = first;
+      }
 
       const accounts = getBulkAccounts().filter((a) => Boolean(a?.followCommentersEnabled) && Boolean(safeString(a?.id).trim()));
       if (accounts.length === 0) return res.status(400).json({ error: "没有可执行账号：请在账号里勾选「关注评论」" });
@@ -5065,6 +5162,7 @@ async function main() {
   });
 
   app.get("/api/bulk/follow-commenters/status", async (_req, res) => {
+    const followUrls = Array.isArray(bulkConfig?.followUrls) ? bulkConfig.followUrls : [];
     const accounts = getBulkAccounts()
       .filter((a) => Boolean(a?.followCommentersEnabled))
       .map((a) => {
@@ -5079,7 +5177,13 @@ async function main() {
           state: st || {},
         };
       });
-    res.json({ ok: true, job: bulkFollowJob, accounts });
+    const queue = {
+      urlsTotal: followUrls.length,
+      urls: followUrls.slice(0, 200),
+      updatedAt: safeString(bulkFollowUrlsUpdatedAt).trim(),
+      currentUrl: safeString(bulkFollowJob?.tweetUrl).trim(),
+    };
+    res.json({ ok: true, job: bulkFollowJob, accounts, queue });
   });
 
   app.post("/api/bulk/test-x-auth", async (req, res) => {
