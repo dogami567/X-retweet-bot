@@ -1068,10 +1068,29 @@ async function sleepWithBulkFollowStop(ms, stepMs = 250) {
   return isBulkFollowStopRequested();
 }
 
+function setBulkFollowSleepState(state, reason, sleepMs) {
+  const st = state && typeof state === "object" ? state : null;
+  if (!st) return;
+  const ms = Math.max(0, Math.round(Number(sleepMs) || 0));
+  st.followSleepReason = safeString(reason).trim();
+  st.followSleepUntil = ms > 0 ? new Date(Date.now() + ms).toISOString() : "";
+}
+
+function clearBulkFollowSleepState(state) {
+  const st = state && typeof state === "object" ? state : null;
+  if (!st) return;
+  st.followSleepReason = "";
+  st.followSleepUntil = "";
+}
+
 function resetBulkFollowJob() {
   bulkFollowJob = {
     running: false,
+    mode: "",
     tweetUrl: "",
+    currentAccountId: "",
+    currentAccount: "",
+    currentUrl: "",
     maxPerAccount: 0,
     followWaitSec: 0,
     followConcurrency: 1,
@@ -2518,12 +2537,17 @@ async function bulkFollowCommentersForAccount(account, tweetUrl, options = {}) {
           `[关注] 已关注 account=${safeString(a.name || a.id)} user=${display} remain=${remainHint}/${effectiveFollowLimit} today=${state.followDailyCount}/${BULK_FOLLOW_COMMENTERS_DAILY_LIMIT}`,
         );
 
+        const actionDelayMs = followActionDelayMs > 0 ? followActionDelayMs : randomIntInclusive(1100, 2400);
+        setBulkFollowSleepState(state, followActionDelayMs > 0 ? "action_delay" : "action_delay_jitter", actionDelayMs);
         // eslint-disable-next-line no-await-in-loop
-        await sleepWithBulkFollowStop(followActionDelayMs > 0 ? followActionDelayMs : randomIntInclusive(1100, 2400));
+        await sleepWithBulkFollowStop(actionDelayMs);
+        clearBulkFollowSleepState(state);
         if (followCooldownMs > 0 && summary.followed > 0 && summary.followed % followCooldownEvery === 0) {
           addBulkLog(`[关注][DBG] 触发冷却 account=${safeString(a.name || a.id)} every=${followCooldownEvery} wait=${followCooldownSec}s`);
+          setBulkFollowSleepState(state, "cooldown", followCooldownMs);
           // eslint-disable-next-line no-await-in-loop
           await sleepWithBulkFollowStop(followCooldownMs);
+          clearBulkFollowSleepState(state);
         }
         continue;
       }
@@ -2542,12 +2566,17 @@ async function bulkFollowCommentersForAccount(account, tweetUrl, options = {}) {
           `[关注][WARN] 已发送关注请求（等待批准） account=${safeString(a.name || a.id)} user=${display} remain=${remainHint}/${effectiveFollowLimit} today=${state.followDailyCount}/${BULK_FOLLOW_COMMENTERS_DAILY_LIMIT}`,
         );
 
+        const actionDelayMs = followActionDelayMs > 0 ? followActionDelayMs : randomIntInclusive(1100, 2400);
+        setBulkFollowSleepState(state, followActionDelayMs > 0 ? "action_delay" : "action_delay_jitter", actionDelayMs);
         // eslint-disable-next-line no-await-in-loop
-        await sleepWithBulkFollowStop(followActionDelayMs > 0 ? followActionDelayMs : randomIntInclusive(1100, 2400));
+        await sleepWithBulkFollowStop(actionDelayMs);
+        clearBulkFollowSleepState(state);
         if (followCooldownMs > 0 && summary.followed > 0 && summary.followed % followCooldownEvery === 0) {
           addBulkLog(`[关注][DBG] 触发冷却 account=${safeString(a.name || a.id)} every=${followCooldownEvery} wait=${followCooldownSec}s`);
+          setBulkFollowSleepState(state, "cooldown", followCooldownMs);
           // eslint-disable-next-line no-await-in-loop
           await sleepWithBulkFollowStop(followCooldownMs);
+          clearBulkFollowSleepState(state);
         }
         continue;
       }
@@ -2558,15 +2587,22 @@ async function bulkFollowCommentersForAccount(account, tweetUrl, options = {}) {
         addBulkLog(
           `[关注][WARN] 已点击关注但未验证成功（可能被限制/受保护/界面未刷新），跳过 account=${safeString(a.name || a.id)} user=${display}`,
         );
+        const state = upsertBulkState(a.id);
+        const waitMs = randomIntInclusive(900, 1600);
+        setBulkFollowSleepState(state, "retry_delay", waitMs);
         // eslint-disable-next-line no-await-in-loop
-        await sleepWithBulkFollowStop(randomIntInclusive(900, 1600));
+        await sleepWithBulkFollowStop(waitMs);
+        clearBulkFollowSleepState(state);
         continue;
       }
 
       summary.failed += 1;
       addBulkLog(`[关注] 失败 account=${safeString(a.name || a.id)} user=${display} error=${safeString(r.error || r.status)}`);
+      const waitMs = randomIntInclusive(900, 1600);
+      setBulkFollowSleepState(state, "retry_delay", waitMs);
       // eslint-disable-next-line no-await-in-loop
-      await sleepWithBulkFollowStop(randomIntInclusive(900, 1600));
+      await sleepWithBulkFollowStop(waitMs);
+      clearBulkFollowSleepState(state);
     }
 
     return summary;
@@ -2590,8 +2626,12 @@ async function runBulkFollowCommenters(tweetUrl, options = {}) {
 
   bulkFollowStopRequested = false;
   bulkFollowJob.running = true;
+  bulkFollowJob.mode = "once";
   bulkFollowJob.stopRequested = false;
   bulkFollowJob.tweetUrl = url;
+  bulkFollowJob.currentAccountId = "";
+  bulkFollowJob.currentAccount = "";
+  bulkFollowJob.currentUrl = url;
   bulkFollowJob.maxPerAccount = maxPerAccount;
   bulkFollowJob.followWaitSec = followWaitSec;
   bulkFollowJob.followConcurrency = followConcurrency;
@@ -2617,6 +2657,10 @@ async function runBulkFollowCommenters(tweetUrl, options = {}) {
       if (!id) return;
       const state = upsertBulkState(id);
       if (!state) return;
+
+      bulkFollowJob.currentAccountId = id;
+      bulkFollowJob.currentAccount = safeString(a.name || a.id);
+      bulkFollowJob.currentUrl = url;
 
       ensureBulkFollowDailyState(state);
       state.followRunning = true;
@@ -2663,7 +2707,10 @@ async function runBulkFollowCommenters(tweetUrl, options = {}) {
       }
 
       // 每个账号之间稍微停一下，避免密集行为（并发场景下每个 worker 自己节流）
-      await sleepWithBulkFollowStop(randomIntInclusive(2000, 4500));
+      const waitMs = randomIntInclusive(2000, 4500);
+      setBulkFollowSleepState(state, "between_accounts", waitMs);
+      await sleepWithBulkFollowStop(waitMs);
+      clearBulkFollowSleepState(state);
     };
 
     const workers = Array.from({ length: concurrency }, async () => {
@@ -2723,8 +2770,12 @@ async function runBulkFollowCommentersQueueLoop(options = {}) {
 
   bulkFollowStopRequested = false;
   bulkFollowJob.running = true;
+  bulkFollowJob.mode = "queue";
   bulkFollowJob.stopRequested = false;
   bulkFollowJob.tweetUrl = "";
+  bulkFollowJob.currentAccountId = "";
+  bulkFollowJob.currentAccount = "";
+  bulkFollowJob.currentUrl = "";
   bulkFollowJob.maxPerAccount = maxPerAccount;
   bulkFollowJob.followWaitSec = followWaitSec;
   bulkFollowJob.followConcurrency = followConcurrency;
@@ -2773,39 +2824,47 @@ async function runBulkFollowCommentersQueueLoop(options = {}) {
         await sleepWithBulkFollowStop(jitterMs);
       }
 
-      while (!isBulkFollowStopRequested()) {
-        const release = await acquireSlot();
-        if (!release) break;
+        while (!isBulkFollowStopRequested()) {
+          const release = await acquireSlot();
+          if (!release) break;
 
-        let postDelayMs = randomIntInclusive(2000, 4500);
-        try {
-          if (isBulkFollowStopRequested()) break;
+          let postDelayMs = randomIntInclusive(2000, 4500);
+          let postDelayReason = "between_urls";
+          try {
+            if (isBulkFollowStopRequested()) break;
 
-          const urls = Array.isArray(bulkConfig?.followUrls) ? bulkConfig.followUrls : [];
-          if (urls.length === 0) {
-            if (!emptyQueueLogged) {
-              emptyQueueLogged = true;
-              addBulkLog(
-                `[关注][DBG] URL 队列为空，进入 idle account=${safeString(a.name || a.id)} wait=${followIdleSleepSec}s`,
-              );
-            }
-            postDelayMs = followIdleSleepSec * 1000;
-          } else {
-            emptyQueueLogged = false;
+            bulkFollowJob.currentAccountId = id;
+            bulkFollowJob.currentAccount = safeString(a.name || a.id);
+            bulkFollowJob.currentUrl = "";
 
-            const idx = Math.max(0, Math.round(Number(state.followQueueIndex) || 0)) % urls.length;
-            const url = safeString(urls[idx]).trim();
-            if (!url) {
-              state.followQueueIndex = (idx + 1) % urls.length;
+            const urls = Array.isArray(bulkConfig?.followUrls) ? bulkConfig.followUrls : [];
+            if (urls.length === 0) {
+              if (!emptyQueueLogged) {
+                emptyQueueLogged = true;
+                addBulkLog(
+                  `[关注][DBG] URL 队列为空，进入 idle account=${safeString(a.name || a.id)} wait=${followIdleSleepSec}s`,
+                );
+              }
+              postDelayReason = "idle_queue_empty";
               postDelayMs = followIdleSleepSec * 1000;
             } else {
-              bulkFollowJob.tweetUrl = url;
-              state.followQueueIndex = idx;
-              ensureBulkFollowDailyState(state);
+              emptyQueueLogged = false;
 
-              state.followRunning = true;
-              state.followLastRunAt = nowIso();
-              state.followLastTweetUrl = url;
+              const idx = Math.max(0, Math.round(Number(state.followQueueIndex) || 0)) % urls.length;
+              const url = safeString(urls[idx]).trim();
+              if (!url) {
+                state.followQueueIndex = (idx + 1) % urls.length;
+                postDelayReason = "idle_queue_item_empty";
+                postDelayMs = followIdleSleepSec * 1000;
+              } else {
+                bulkFollowJob.tweetUrl = url;
+                bulkFollowJob.currentUrl = url;
+                state.followQueueIndex = idx;
+                ensureBulkFollowDailyState(state);
+
+                state.followRunning = true;
+                state.followLastRunAt = nowIso();
+                state.followLastTweetUrl = url;
               state.followDone = 0;
               state.followSkipped = 0;
               state.followWarnings = 0;
@@ -2813,21 +2872,23 @@ async function runBulkFollowCommentersQueueLoop(options = {}) {
               state.followLastError = "";
               state.followLastErrorAt = "";
 
-              const remainDaily = getBulkFollowRemaining(state);
-              const remain = Math.min(remainDaily, maxPerAccount);
-              if (remainDaily <= 0) {
-                const waitMs = Math.max(followIdleSleepSec * 1000, msUntilNextLocalMidnight() + randomIntInclusive(1000, 8000));
-                addBulkLog(
-                  `[关注] 今日已达上限，将等待到明天 account=${safeString(a.name || a.id)} wait=${Math.round(waitMs / 1000)}s today=${state.followDailyCount}/${BULK_FOLLOW_COMMENTERS_DAILY_LIMIT}`,
-                );
-                postDelayMs = waitMs;
-              } else if (remain <= 0) {
-                addBulkLog(`[关注] 已达本次上限，跳过 account=${safeString(a.name || a.id)} perUrl=${maxPerAccount}`);
-                postDelayMs = followIdleSleepSec * 1000;
-              } else {
-                const r = await bulkFollowCommentersForAccount(a, url, {
-                  remainDaily,
-                  maxFollow: remain,
+                const remainDaily = getBulkFollowRemaining(state);
+                const remain = Math.min(remainDaily, maxPerAccount);
+                if (remainDaily <= 0) {
+                  const waitMs = Math.max(followIdleSleepSec * 1000, msUntilNextLocalMidnight() + randomIntInclusive(1000, 8000));
+                  addBulkLog(
+                    `[关注] 今日已达上限，将等待到明天 account=${safeString(a.name || a.id)} wait=${Math.round(waitMs / 1000)}s today=${state.followDailyCount}/${BULK_FOLLOW_COMMENTERS_DAILY_LIMIT}`,
+                  );
+                  postDelayReason = "daily_limit_wait";
+                  postDelayMs = waitMs;
+                } else if (remain <= 0) {
+                  addBulkLog(`[关注] 已达本次上限，跳过 account=${safeString(a.name || a.id)} perUrl=${maxPerAccount}`);
+                  postDelayReason = "per_url_limit_wait";
+                  postDelayMs = followIdleSleepSec * 1000;
+                } else {
+                  const r = await bulkFollowCommentersForAccount(a, url, {
+                    remainDaily,
+                    maxFollow: remain,
                   followWaitSec,
                   followActionDelaySec,
                   followCooldownEvery,
@@ -2841,11 +2902,12 @@ async function runBulkFollowCommentersQueueLoop(options = {}) {
                   `[关注] 完成 account=${safeString(a.name || a.id)} url=${url} followed=${state.followDone} skipped=${state.followSkipped} warn=${state.followWarnings} failed=${state.followFailed} today=${state.followDailyCount}/${BULK_FOLLOW_COMMENTERS_DAILY_LIMIT}`,
                 );
 
-                const ended = safeString(r?.endedBecause).trim();
-                if (ended === "no_new" || ended === "scanned0") {
-                  postDelayMs = Math.max(postDelayMs, followIdleSleepSec * 1000);
+                  const ended = safeString(r?.endedBecause).trim();
+                  if (ended === "no_new" || ended === "scanned0") {
+                    postDelayReason = "idle_no_new";
+                    postDelayMs = Math.max(postDelayMs, followIdleSleepSec * 1000);
+                  }
                 }
-              }
 
               const nextIdx = urls.length > 0 ? (idx + 1) % urls.length : 0;
               state.followQueueIndex = nextIdx;
@@ -2863,14 +2925,16 @@ async function runBulkFollowCommentersQueueLoop(options = {}) {
           state.followLastError = safeString(e?.message || e);
           state.followLastErrorAt = nowIso();
           addBulkLog(`[关注] 账号执行失败 account=${safeString(a.name || a.id)} error=${state.followLastError}`);
-        } finally {
-          state.followRunning = false;
-          release();
-        }
+          } finally {
+            state.followRunning = false;
+            release();
+          }
 
-        // eslint-disable-next-line no-await-in-loop
-        await sleepWithBulkFollowStop(postDelayMs);
-      }
+          setBulkFollowSleepState(state, postDelayReason, postDelayMs);
+          // eslint-disable-next-line no-await-in-loop
+          await sleepWithBulkFollowStop(postDelayMs);
+          clearBulkFollowSleepState(state);
+        }
 
       bulkFollowJob.accountsDone += 1;
     };
@@ -3745,7 +3809,11 @@ const bulkTimers = new Map(); // accountId -> Timeout
 const bulkStates = new Map(); // accountId -> state
 let bulkFollowJob = {
   running: false,
+  mode: "",
   tweetUrl: "",
+  currentAccountId: "",
+  currentAccount: "",
+  currentUrl: "",
   maxPerAccount: 0,
   followWaitSec: 0,
   followConcurrency: 1,
@@ -3834,6 +3902,8 @@ function upsertBulkState(accountId) {
       followFailed: 0,
       followLastError: "",
       followLastErrorAt: "",
+      followSleepUntil: "",
+      followSleepReason: "",
     });
   }
   return bulkStates.get(id);
@@ -5318,12 +5388,14 @@ async function main() {
           followDone: 0,
           followSkipped: 0,
           followWarnings: 0,
-          followFailed: 0,
-          followLastError: "",
-          followLastErrorAt: "",
-        },
-      };
-    });
+           followFailed: 0,
+           followLastError: "",
+           followLastErrorAt: "",
+           followSleepUntil: "",
+           followSleepReason: "",
+         },
+       };
+     });
 
     res.json({
       ok: true,
@@ -5464,11 +5536,26 @@ async function main() {
           state: st || {},
         };
       });
+
+    const currentAccountId = safeString(bulkFollowJob?.currentAccountId).trim();
+    const currentAccount = safeString(bulkFollowJob?.currentAccount).trim();
+    const currentState = currentAccountId ? bulkStates.get(currentAccountId) : null;
+    const sleepUntil = safeString(currentState?.followSleepUntil).trim();
+    const sleepReason = safeString(currentState?.followSleepReason).trim();
+    const sleepUntilMs = sleepUntil ? Date.parse(sleepUntil) : NaN;
+    const sleepRemainingSec =
+      Number.isFinite(sleepUntilMs) && sleepUntilMs > Date.now() ? Math.max(0, Math.round((sleepUntilMs - Date.now()) / 1000)) : 0;
+
     const queue = {
       urlsTotal: followUrls.length,
       urls: followUrls.slice(0, 200),
       updatedAt: safeString(bulkFollowUrlsUpdatedAt).trim(),
-      currentUrl: safeString(bulkFollowJob?.tweetUrl).trim(),
+      currentUrl: safeString(bulkFollowJob?.currentUrl || bulkFollowJob?.tweetUrl).trim(),
+      currentAccountId,
+      currentAccount,
+      sleepReason,
+      sleepRemainingSec,
+      cooldownRemainingSec: sleepReason === "cooldown" ? sleepRemainingSec : 0,
     };
     res.json({ ok: true, job: bulkFollowJob, accounts, queue });
   });
