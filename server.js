@@ -1045,6 +1045,22 @@ function isBulkFollowStopRequested() {
   return bulkFollowStopRequested === true;
 }
 
+async function sleepWithBulkFollowStop(ms, stepMs = 250) {
+  const total = Math.max(0, Math.round(Number(ms) || 0));
+  if (total <= 0) return isBulkFollowStopRequested();
+  const step = Math.max(50, Math.min(1000, Math.round(Number(stepMs) || 250)));
+
+  let remaining = total;
+  while (remaining > 0) {
+    if (isBulkFollowStopRequested()) return true;
+    const chunk = Math.min(step, remaining);
+    // eslint-disable-next-line no-await-in-loop
+    await sleep(chunk);
+    remaining -= chunk;
+  }
+  return isBulkFollowStopRequested();
+}
+
 function resetBulkFollowJob() {
   bulkFollowJob = {
     running: false,
@@ -1533,13 +1549,14 @@ async function followUserFromProfile(page, options = {}) {
   const waitStart = Date.now();
   let snap = null;
   while (Date.now() - waitStart < waitForButtonMs) {
+    if (isBulkFollowStopRequested()) return { status: "stopped" };
     // eslint-disable-next-line no-await-in-loop
     snap = await getFollowSnapshot();
     if (snap?.best) {
       if (!targetHandle || snap.matched) break;
     }
     // eslint-disable-next-line no-await-in-loop
-    await sleep(280);
+    await sleepWithBulkFollowStop(280);
   }
 
   if (!snap?.best) return { status: "button_not_found" };
@@ -1666,8 +1683,9 @@ async function followUserFromProfile(page, options = {}) {
     let sawPositive = false;
 
     while (Date.now() - confirmStart < confirmTimeoutMs) {
+      if (isBulkFollowStopRequested()) return { status: "stopped", sawPositive };
       // eslint-disable-next-line no-await-in-loop
-      await sleep(260);
+      await sleepWithBulkFollowStop(260);
       // eslint-disable-next-line no-await-in-loop
       const s = await getFollowSnapshot();
       const st = safeString(s?.best?.state);
@@ -1705,6 +1723,7 @@ async function followUserFromProfile(page, options = {}) {
   };
 
   for (let attempt = 1; attempt <= maxClickAttempts; attempt += 1) {
+    if (isBulkFollowStopRequested()) return { status: "stopped" };
     // eslint-disable-next-line no-await-in-loop
     const clickRes = await clickOnce();
     if (!clickRes?.clicked) return { status: "clicked" };
@@ -1713,13 +1732,14 @@ async function followUserFromProfile(page, options = {}) {
     const confirm = await confirmState();
     if (confirm.status === "followed") return { status: "followed" };
     if (confirm.status === "requested") return { status: "requested" };
+    if (confirm.status === "stopped") return { status: "stopped" };
 
     // 如果已经出现过“Following/Requested”，不要二次点击，避免误触取消关注/重复请求
     if (confirm.sawPositive) return { status: "clicked" };
 
     // 重试前再检查一次：如果仍显示 not_following 才允许继续点
     // eslint-disable-next-line no-await-in-loop
-    await sleep(900 + attempt * 250);
+    await sleepWithBulkFollowStop(900 + attempt * 250);
     // eslint-disable-next-line no-await-in-loop
     const s = await getFollowSnapshot();
     const st = safeString(s?.best?.state);
@@ -1915,7 +1935,7 @@ async function bulkFollowCommentersForAccount(account, tweetUrl, options = {}) {
     } catch {}
 
     await commentPage.waitForSelector("article", { timeout: 15_000 }).catch(() => {});
-    await sleep(900);
+    await sleepWithBulkFollowStop(900);
     // 给评论/回复一点加载时间（否则很容易只看到主推文作者，exclude 后会变成 0）
     await commentPage.waitForFunction(() => document.querySelectorAll("article").length > 1, { timeout: 6000 }).catch(() => {});
     try {
@@ -1967,6 +1987,20 @@ async function bulkFollowCommentersForAccount(account, tweetUrl, options = {}) {
     const remainDaily = Math.max(0, Math.round(Number(options.remainDaily || 0)));
     const maxFollow = Math.max(1, Math.round(Number(options.maxFollow || 0) || 1));
     const followWaitSec = Math.max(3, Math.min(600, Math.round(Number(options.followWaitSec || 0) || 18)));
+    const followActionDelaySec = Math.max(
+      0,
+      Math.min(600, Math.round(Number(options.followActionDelaySec ?? bulkConfig?.followActionDelaySec ?? 0) || 0)),
+    );
+    const followCooldownEvery = Math.max(
+      0,
+      Math.min(200, Math.round(Number(options.followCooldownEvery ?? bulkConfig?.followCooldownEvery ?? 0) || 0)),
+    );
+    const followCooldownSec = Math.max(
+      0,
+      Math.min(3600, Math.round(Number(options.followCooldownSec ?? bulkConfig?.followCooldownSec ?? 0) || 0)),
+    );
+    const followActionDelayMs = followActionDelaySec > 0 ? followActionDelaySec * 1000 : 0;
+    const followCooldownMs = followCooldownEvery > 0 && followCooldownSec > 0 ? followCooldownSec * 1000 : 0;
     const effectiveFollowLimit = Math.max(1, Math.min(remainDaily || maxFollow, maxFollow));
     const authorFromUrl = extractStatusAuthorFromUrl(tweetUrl);
     let excludeAuthor = authorFromUrl;
@@ -2282,7 +2316,7 @@ async function bulkFollowCommentersForAccount(account, tweetUrl, options = {}) {
               } catch {}
             }, aggressiveScroll)
             .catch(() => {});
-          await sleep(randomIntInclusive(700, 1400));
+          await sleepWithBulkFollowStop(randomIntInclusive(700, 1400));
 
           // 评论区已没有新用户了：提前结束
           if (pending.length === 0 && (noNewRounds >= noNewLimit || seen.size >= maxScanUsers)) {
@@ -2332,6 +2366,7 @@ async function bulkFollowCommentersForAccount(account, tweetUrl, options = {}) {
         }
       }
 
+      if (isBulkFollowStopRequested()) break;
       const target = safeString(pending.shift()).trim();
       if (!target) continue;
 
@@ -2352,7 +2387,7 @@ async function bulkFollowCommentersForAccount(account, tweetUrl, options = {}) {
       } catch (e) {
         summary.failed += 1;
         addBulkLog(`[关注] 进入主页失败 account=${safeString(a.name || a.id)} user=${display} error=${safeString(e?.message || e)}`);
-        await sleep(randomIntInclusive(900, 1600));
+        await sleepWithBulkFollowStop(randomIntInclusive(900, 1600));
         continue;
       }
 
@@ -2382,12 +2417,12 @@ async function bulkFollowCommentersForAccount(account, tweetUrl, options = {}) {
           summary.skipped += 1;
           summary.warnings += 1;
           addBulkLog(`[关注][WARN] 导航后 URL 非目标主页，跳过 account=${safeString(a.name || a.id)} user=${display} url=${safeString(currentUrl).toLowerCase()}`);
-          await sleep(randomIntInclusive(900, 1600));
+          await sleepWithBulkFollowStop(randomIntInclusive(900, 1600));
           continue;
         }
       }
 
-      await sleep(randomIntInclusive(800, 1400));
+      await sleepWithBulkFollowStop(randomIntInclusive(800, 1400));
 
       if (isLoginLikeUrl(actionPage.url())) {
         throw new Error("未登录：请先点“打开浏览器登录”完成登录");
@@ -2420,6 +2455,8 @@ async function bulkFollowCommentersForAccount(account, tweetUrl, options = {}) {
         status: "error",
         error: safeString(e?.message || e),
       }));
+
+      if (r.status === "stopped") break;
 
       if (r.status === "already_following") {
         summary.skipped += 1;
@@ -2456,7 +2493,12 @@ async function bulkFollowCommentersForAccount(account, tweetUrl, options = {}) {
         );
 
         // eslint-disable-next-line no-await-in-loop
-        await sleep(randomIntInclusive(1100, 2400));
+        await sleepWithBulkFollowStop(followActionDelayMs > 0 ? followActionDelayMs : randomIntInclusive(1100, 2400));
+        if (followCooldownMs > 0 && summary.followed > 0 && summary.followed % followCooldownEvery === 0) {
+          addBulkLog(`[关注][DBG] 触发冷却 account=${safeString(a.name || a.id)} every=${followCooldownEvery} wait=${followCooldownSec}s`);
+          // eslint-disable-next-line no-await-in-loop
+          await sleepWithBulkFollowStop(followCooldownMs);
+        }
         continue;
       }
 
@@ -2475,7 +2517,12 @@ async function bulkFollowCommentersForAccount(account, tweetUrl, options = {}) {
         );
 
         // eslint-disable-next-line no-await-in-loop
-        await sleep(randomIntInclusive(1100, 2400));
+        await sleepWithBulkFollowStop(followActionDelayMs > 0 ? followActionDelayMs : randomIntInclusive(1100, 2400));
+        if (followCooldownMs > 0 && summary.followed > 0 && summary.followed % followCooldownEvery === 0) {
+          addBulkLog(`[关注][DBG] 触发冷却 account=${safeString(a.name || a.id)} every=${followCooldownEvery} wait=${followCooldownSec}s`);
+          // eslint-disable-next-line no-await-in-loop
+          await sleepWithBulkFollowStop(followCooldownMs);
+        }
         continue;
       }
 
@@ -2486,14 +2533,14 @@ async function bulkFollowCommentersForAccount(account, tweetUrl, options = {}) {
           `[关注][WARN] 已点击关注但未验证成功（可能被限制/受保护/界面未刷新），跳过 account=${safeString(a.name || a.id)} user=${display}`,
         );
         // eslint-disable-next-line no-await-in-loop
-        await sleep(randomIntInclusive(900, 1600));
+        await sleepWithBulkFollowStop(randomIntInclusive(900, 1600));
         continue;
       }
 
       summary.failed += 1;
       addBulkLog(`[关注] 失败 account=${safeString(a.name || a.id)} user=${display} error=${safeString(r.error || r.status)}`);
       // eslint-disable-next-line no-await-in-loop
-      await sleep(randomIntInclusive(900, 1600));
+      await sleepWithBulkFollowStop(randomIntInclusive(900, 1600));
     }
 
     return summary;
@@ -2590,7 +2637,7 @@ async function runBulkFollowCommenters(tweetUrl, options = {}) {
       }
 
       // 每个账号之间稍微停一下，避免密集行为（并发场景下每个 worker 自己节流）
-      await sleep(randomIntInclusive(2000, 4500));
+      await sleepWithBulkFollowStop(randomIntInclusive(2000, 4500));
     };
 
     const workers = Array.from({ length: concurrency }, async () => {
@@ -2605,7 +2652,7 @@ async function runBulkFollowCommenters(tweetUrl, options = {}) {
         if (followConcurrency > 1 && followJitterSec > 0) {
           const jitterMs = randomIntInclusive(0, followJitterSec * 1000);
           // eslint-disable-next-line no-await-in-loop
-          await sleep(jitterMs);
+          await sleepWithBulkFollowStop(jitterMs);
         }
 
         // eslint-disable-next-line no-await-in-loop
@@ -2614,6 +2661,172 @@ async function runBulkFollowCommenters(tweetUrl, options = {}) {
     });
 
     await Promise.all(workers);
+  } finally {
+    bulkFollowJob.running = false;
+    bulkFollowJob.finishedAt = nowIso();
+
+    if (isBulkFollowStopRequested()) addBulkLog("[关注] 已停止");
+    else addBulkLog("[关注] 全部账号已完成");
+  }
+}
+
+async function runBulkFollowCommentersQueueLoop(options = {}) {
+  if (bulkFollowJob?.running) throw new Error("关注任务正在运行中，请先停止或等待结束");
+
+  const maxPerAccountRaw = Math.round(Number(options?.maxPerAccount) || 30);
+  const maxPerAccount = Math.max(1, Math.min(BULK_FOLLOW_COMMENTERS_DAILY_LIMIT, maxPerAccountRaw));
+  const followWaitSec = Math.max(3, Math.min(600, Math.round(Number(options?.followWaitSec ?? bulkConfig?.followWaitSec ?? 18) || 18)));
+  const followConcurrency = Math.max(1, Math.min(6, Math.round(Number(options?.followConcurrency ?? bulkConfig?.followConcurrency ?? 1) || 1)));
+  const followJitterSec = Math.max(0, Math.min(120, Math.round(Number(options?.followJitterSec ?? bulkConfig?.followJitterSec ?? 4) || 0)));
+  const followActionDelaySec = Math.max(
+    0,
+    Math.min(600, Math.round(Number(options?.followActionDelaySec ?? bulkConfig?.followActionDelaySec ?? 0) || 0)),
+  );
+  const followCooldownEvery = Math.max(
+    0,
+    Math.min(200, Math.round(Number(options?.followCooldownEvery ?? bulkConfig?.followCooldownEvery ?? 0) || 0)),
+  );
+  const followCooldownSec = Math.max(
+    0,
+    Math.min(3600, Math.round(Number(options?.followCooldownSec ?? bulkConfig?.followCooldownSec ?? 0) || 0)),
+  );
+  const followIdleSleepSec = Math.max(5, Math.min(3600, Math.round(Number(options?.followIdleSleepSec ?? bulkConfig?.followIdleSleepSec ?? 30) || 30)));
+
+  const accounts = getBulkAccounts().filter((a) => Boolean(a?.followCommentersEnabled) && Boolean(safeString(a?.id).trim()));
+  if (accounts.length === 0) throw new Error("没有可执行账号：请在账号里勾选「关注评论」");
+
+  bulkFollowStopRequested = false;
+  bulkFollowJob.running = true;
+  bulkFollowJob.stopRequested = false;
+  bulkFollowJob.tweetUrl = "";
+  bulkFollowJob.maxPerAccount = maxPerAccount;
+  bulkFollowJob.followWaitSec = followWaitSec;
+  bulkFollowJob.followConcurrency = followConcurrency;
+  bulkFollowJob.followJitterSec = followJitterSec;
+  bulkFollowJob.startedAt = nowIso();
+  bulkFollowJob.finishedAt = "";
+  bulkFollowJob.accountsTotal = accounts.length;
+  bulkFollowJob.accountsDone = 0;
+
+  addBulkLog(
+    `[关注] 开始队列 accounts=${accounts.length} concurrency=${followConcurrency} jitter=${followJitterSec}s perUrl=本次每号${maxPerAccount} wait=${followWaitSec}s actionDelay=${followActionDelaySec}s cooldownEvery=${followCooldownEvery} cooldown=${followCooldownSec}s idle=${followIdleSleepSec}s`,
+  );
+
+  try {
+    const total = accounts.length;
+    const concurrency = Math.min(Math.max(1, followConcurrency), total || 1);
+    let inUse = 0;
+
+    const acquireSlot = async () => {
+      while (!isBulkFollowStopRequested()) {
+        if (inUse < concurrency) {
+          inUse += 1;
+          return () => {
+            inUse = Math.max(0, inUse - 1);
+          };
+        }
+        // eslint-disable-next-line no-await-in-loop
+        await sleepWithBulkFollowStop(220);
+      }
+      return null;
+    };
+
+    const runAccountLoop = async (a) => {
+      const id = safeString(a?.id).trim();
+      if (!id) return;
+      const state = upsertBulkState(id);
+      if (!state) return;
+
+      ensureBulkFollowDailyState(state);
+      if (!Number.isFinite(Number(state.followQueueIndex))) state.followQueueIndex = 0;
+
+      // 启动抖动：避免同时打开浏览器/同时操作
+      if (concurrency > 1 && followJitterSec > 0) {
+        const jitterMs = randomIntInclusive(0, followJitterSec * 1000);
+        await sleepWithBulkFollowStop(jitterMs);
+      }
+
+      while (!isBulkFollowStopRequested()) {
+        const release = await acquireSlot();
+        if (!release) break;
+
+        let postDelayMs = randomIntInclusive(2000, 4500);
+        try {
+          if (isBulkFollowStopRequested()) break;
+
+          const urls = Array.isArray(bulkConfig?.followUrls) ? bulkConfig.followUrls : [];
+          if (urls.length === 0) {
+            postDelayMs = followIdleSleepSec * 1000;
+            continue;
+          }
+
+          const idx = Math.max(0, Math.round(Number(state.followQueueIndex) || 0)) % urls.length;
+          const url = safeString(urls[idx]).trim();
+          if (!url) {
+            state.followQueueIndex = (idx + 1) % urls.length;
+            postDelayMs = followIdleSleepSec * 1000;
+            continue;
+          }
+
+          bulkFollowJob.tweetUrl = url;
+          state.followQueueIndex = idx;
+          ensureBulkFollowDailyState(state);
+
+          state.followRunning = true;
+          state.followLastRunAt = nowIso();
+          state.followLastTweetUrl = url;
+          state.followDone = 0;
+          state.followSkipped = 0;
+          state.followWarnings = 0;
+          state.followFailed = 0;
+          state.followLastError = "";
+          state.followLastErrorAt = "";
+
+          const remainDaily = getBulkFollowRemaining(state);
+          const remain = Math.min(remainDaily, maxPerAccount);
+          if (remainDaily <= 0) {
+            addBulkLog(`[关注] 今日已达上限，暂停 account=${safeString(a.name || a.id)} today=${state.followDailyCount}/${BULK_FOLLOW_COMMENTERS_DAILY_LIMIT}`);
+            postDelayMs = followIdleSleepSec * 1000;
+          } else if (remain <= 0) {
+            addBulkLog(`[关注] 已达本次上限，跳过 account=${safeString(a.name || a.id)} perUrl=${maxPerAccount}`);
+            postDelayMs = followIdleSleepSec * 1000;
+          } else {
+            const r = await bulkFollowCommentersForAccount(a, url, {
+              remainDaily,
+              maxFollow: remain,
+              followWaitSec,
+              followActionDelaySec,
+              followCooldownEvery,
+              followCooldownSec,
+            });
+            state.followDone = Number(r?.followed || 0);
+            state.followSkipped = Number(r?.skipped || 0);
+            state.followWarnings = Number(r?.warnings || 0);
+            state.followFailed = Number(r?.failed || 0);
+            addBulkLog(
+              `[关注] 完成 account=${safeString(a.name || a.id)} url=${url} followed=${state.followDone} skipped=${state.followSkipped} warn=${state.followWarnings} failed=${state.followFailed} today=${state.followDailyCount}/${BULK_FOLLOW_COMMENTERS_DAILY_LIMIT}`,
+            );
+          }
+
+          state.followQueueIndex = urls.length > 0 ? (idx + 1) % urls.length : 0;
+        } catch (e) {
+          state.followLastError = safeString(e?.message || e);
+          state.followLastErrorAt = nowIso();
+          addBulkLog(`[关注] 账号执行失败 account=${safeString(a.name || a.id)} error=${state.followLastError}`);
+        } finally {
+          state.followRunning = false;
+          release();
+        }
+
+        // eslint-disable-next-line no-await-in-loop
+        await sleepWithBulkFollowStop(postDelayMs);
+      }
+
+      bulkFollowJob.accountsDone += 1;
+    };
+
+    const loops = accounts.map((a) => runAccountLoop(a));
+    await Promise.all(loops);
   } finally {
     bulkFollowJob.running = false;
     bulkFollowJob.finishedAt = nowIso();
@@ -5133,14 +5346,15 @@ async function main() {
       } else {
         const first = Array.isArray(bulkConfig?.followUrls) ? safeString(bulkConfig.followUrls[0]).trim() : "";
         if (!first) return res.status(400).json({ error: "缺少 tweetUrl，且 URL 队列为空：请先追加链接或直接填写链接启动" });
-        url = first;
       }
 
       const accounts = getBulkAccounts().filter((a) => Boolean(a?.followCommentersEnabled) && Boolean(safeString(a?.id).trim()));
       if (accounts.length === 0) return res.status(400).json({ error: "没有可执行账号：请在账号里勾选「关注评论」" });
 
       // 启动后台任务（不阻塞接口）
-      runBulkFollowCommenters(url, { maxPerAccount, followWaitSec, followConcurrency, followJitterSec }).catch((e) => {
+      const starter = tweetUrlRaw ? "once" : "queue";
+      const startTask = starter === "once" ? runBulkFollowCommenters(url, { maxPerAccount, followWaitSec, followConcurrency, followJitterSec }) : runBulkFollowCommentersQueueLoop({ maxPerAccount, followWaitSec, followConcurrency, followJitterSec });
+      startTask.catch((e) => {
         const err = safeString(e?.message || e);
         addBulkLog(`[关注] 全局任务异常：${err}`);
         bulkFollowJob.running = false;
