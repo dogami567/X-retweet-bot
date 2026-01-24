@@ -3780,6 +3780,27 @@ function ensureBulkAccountIds(cfgFile) {
   return { changed, config: next };
 }
 
+function migrateBulkConfigLegacyTweetUrl(cfgFile) {
+  const next = cfgFile && typeof cfgFile === "object" ? cfgFile : {};
+  const legacy = safeString(next.tweetUrl).trim();
+  if (!legacy) return { changed: false, config: next };
+
+  let changed = false;
+  const normalized = normalizeXStatusUrl(legacy);
+  if (normalized && isLikelyXStatusUrl(normalized)) {
+    const list = Array.isArray(next.followUrls) ? next.followUrls : [];
+    if (list.length === 0) {
+      next.followUrls = [normalized];
+      changed = true;
+    }
+  }
+
+  // 迁移后移除旧字段，避免后续继续误用
+  delete next.tweetUrl;
+  changed = true;
+  return { changed, config: next };
+}
+
 function getBulkAccounts() {
   return Array.isArray(bulkConfig?.accounts) ? bulkConfig.accounts : [];
 }
@@ -4774,6 +4795,11 @@ async function main() {
   const ensured = ensureBulkAccountIds(bulkConfigFile);
   if (ensured.changed) {
     bulkConfigFile = ensured.config;
+    await writeJson(BULK_CONFIG_PATH, bulkConfigFile);
+  }
+  const migrated = migrateBulkConfigLegacyTweetUrl(bulkConfigFile);
+  if (migrated.changed) {
+    bulkConfigFile = migrated.config;
     await writeJson(BULK_CONFIG_PATH, bulkConfigFile);
   }
   bulkConfig = normalizeBulkConfig(bulkConfigFile);
