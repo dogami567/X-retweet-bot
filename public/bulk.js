@@ -59,7 +59,19 @@ function isLikelyImageFile(file) {
   return isImageName(f.name);
 }
 
-let config = { version: 1, imageDir: "", scanIntervalSec: 3600, followWaitSec: 18, followConcurrency: 1, followJitterSec: 4, captions: [], accounts: [] };
+let config = {
+  version: 1,
+  imageDir: "",
+  scanIntervalSec: 3600,
+  followWaitSec: 18,
+  followConcurrency: 1,
+  followJitterSec: 4,
+  followActionDelaySec: 0,
+  followCooldownEvery: 0,
+  followCooldownSec: 0,
+  captions: [],
+  accounts: [],
+};
 let selectedAccountId = "";
 let selectedCaptionIndex = -1;
 let uploadPreviewObjectUrls = [];
@@ -208,6 +220,9 @@ function applyBaseFormToConfig() {
   config.followWaitSec = Number(byId("followWaitSec")?.value || 18);
   config.followConcurrency = Number(byId("followConcurrency")?.value || 1);
   config.followJitterSec = Number(byId("followJitterSec")?.value || 4);
+  config.followActionDelaySec = Number(byId("followActionDelaySec")?.value || 0);
+  config.followCooldownEvery = Number(byId("followCooldownEvery")?.value || 0);
+  config.followCooldownSec = Number(byId("followCooldownSec")?.value || 0);
 }
 
 function renderBaseForm() {
@@ -219,6 +234,12 @@ function renderBaseForm() {
   if (followConcEl) followConcEl.value = String(config.followConcurrency ?? 1);
   const followJitterEl = byId("followJitterSec");
   if (followJitterEl) followJitterEl.value = String(config.followJitterSec ?? 4);
+  const followActionDelayEl = byId("followActionDelaySec");
+  if (followActionDelayEl) followActionDelayEl.value = String(config.followActionDelaySec ?? 0);
+  const followCooldownEveryEl = byId("followCooldownEvery");
+  if (followCooldownEveryEl) followCooldownEveryEl.value = String(config.followCooldownEvery ?? 0);
+  const followCooldownSecEl = byId("followCooldownSec");
+  if (followCooldownSecEl) followCooldownSecEl.value = String(config.followCooldownSec ?? 0);
 }
 
 function renderCaptionList() {
@@ -342,6 +363,9 @@ async function loadConfig() {
   if (!Number.isFinite(Number(config.followWaitSec))) config.followWaitSec = 18;
   if (!Number.isFinite(Number(config.followConcurrency))) config.followConcurrency = 1;
   if (!Number.isFinite(Number(config.followJitterSec))) config.followJitterSec = 4;
+  if (!Number.isFinite(Number(config.followActionDelaySec))) config.followActionDelaySec = 0;
+  if (!Number.isFinite(Number(config.followCooldownEvery))) config.followCooldownEvery = 0;
+  if (!Number.isFinite(Number(config.followCooldownSec))) config.followCooldownSec = 0;
 
   renderBaseForm();
   renderCaptionList();
@@ -360,6 +384,9 @@ async function saveConfig() {
   if (!Number.isFinite(Number(config.followWaitSec))) config.followWaitSec = 18;
   if (!Number.isFinite(Number(config.followConcurrency))) config.followConcurrency = 1;
   if (!Number.isFinite(Number(config.followJitterSec))) config.followJitterSec = 4;
+  if (!Number.isFinite(Number(config.followActionDelaySec))) config.followActionDelaySec = 0;
+  if (!Number.isFinite(Number(config.followCooldownEvery))) config.followCooldownEvery = 0;
+  if (!Number.isFinite(Number(config.followCooldownSec))) config.followCooldownSec = 0;
   renderBaseForm();
   renderCaptionList();
   renderAccountsList();
@@ -435,20 +462,36 @@ function setFollowJobHint(job) {
   el.textContent = `状态：未开始`;
 }
 
+function setFollowQueueHint(queue) {
+  const el = byId("followQueueHint");
+  if (!el) return;
+
+  const q = queue && typeof queue === "object" ? queue : {};
+  const total = Number(q.urlsTotal ?? 0);
+  const currentUrl = String(q.currentUrl || "").trim();
+  const updatedAt = String(q.updatedAt || "").trim();
+  const updatedAtText = updatedAt ? new Date(updatedAt).toLocaleString() : "";
+
+  const currentText = currentUrl ? ` | 当前：${currentUrl}` : "";
+  const updatedText = updatedAtText ? ` | 更新：${updatedAtText}` : "";
+  el.textContent = `队列：${total}${currentText}${updatedText}`;
+}
+
 async function followCommentersStart() {
   // 确保账号勾选/代理等最新配置已落盘，否则服务端拿到的还是旧配置
   await saveConfig();
 
   const tweetUrl = byId("followTweetUrl")?.value?.trim() || "";
-  if (!tweetUrl) throw new Error("请先填写 X 帖子链接");
-
   const maxPerAccount = Number(byId("followMaxPerAccount")?.value || 30);
   const followWaitSec = Number(byId("followWaitSec")?.value || 18);
   const followConcurrency = Number(byId("followConcurrency")?.value || 1);
   const followJitterSec = Number(byId("followJitterSec")?.value || 4);
+
+  const body = { maxPerAccount, followWaitSec, followConcurrency, followJitterSec };
+  if (tweetUrl) body.tweetUrl = tweetUrl;
   const res = await api("/api/bulk/follow-commenters/start", {
     method: "POST",
-    body: JSON.stringify({ tweetUrl, maxPerAccount, followWaitSec, followConcurrency, followJitterSec }),
+    body: JSON.stringify(body),
   });
   setJsonBox(res);
   setFollowJobHint(res?.job || res?.followJob || null);
@@ -469,7 +512,38 @@ async function followCommentersStatus(options = {}) {
   const res = await api("/api/bulk/follow-commenters/status");
   if (!silent) setJsonBox(res);
   setFollowJobHint(res?.job || null);
+  setFollowQueueHint(res?.queue || null);
   return res;
+}
+
+async function followUrlsAdd() {
+  // 追加前先保存配置（避免“账号勾选关注”之类的配置未落盘）
+  await saveConfig();
+
+  const text = byId("followUrlsInput")?.value || "";
+  if (!String(text).trim()) throw new Error("请先输入至少 1 条 /status/ 链接");
+
+  const res = await fetch("/api/bulk/follow-urls/add", {
+    method: "POST",
+    cache: "no-store",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ text }),
+  });
+
+  const contentType = res.headers.get("content-type") || "";
+  const data = contentType.includes("application/json") ? await res.json() : await res.text();
+  if (!res.ok) {
+    setJsonBox(data);
+    return;
+  }
+
+  const input = byId("followUrlsInput");
+  if (input) input.value = "";
+
+  setJsonBox(data);
+  showLogsTab();
+  await refreshLogs({ silent: true }).catch(() => {});
+  await followCommentersStatus({ silent: true }).catch(() => {});
 }
 
 async function refreshDebug(options = {}) {
@@ -826,6 +900,7 @@ async function refreshStatus(options = {}) {
   renderStatusTable(data?.accounts || []);
   renderErrorTable(data?.accounts || []);
   setFollowJobHint(data?.followJob || null);
+  await followCommentersStatus({ silent: true }).catch(() => {});
 
   const count = Number(data?.images?.count ?? 0);
   const scannedAt = data?.images?.scannedAt ? new Date(data.images.scannedAt).toLocaleString() : "";
@@ -892,6 +967,7 @@ bind("btnBulkStop", "click", stopBulk);
 bind("btnTestXAuth", "click", testXAuth);
 bind("btnRunOnce", "click", runOnce);
 
+bind("btnFollowUrlsAdd", "click", followUrlsAdd);
 bind("btnFollowCommentersStart", "click", followCommentersStart);
 bind("btnFollowCommentersStop", "click", followCommentersStop);
 bind("btnFollowCommentersStatus", "click", () => followCommentersStatus({ silent: false }));
