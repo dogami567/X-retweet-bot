@@ -562,6 +562,11 @@ function defaultBulkConfig() {
     followWaitSec: 18,
     followConcurrency: 1,
     followJitterSec: 4,
+    followUrls: [],
+    followActionDelaySec: 2,
+    followCooldownEvery: 0,
+    followCooldownSec: 0,
+    followIdleSleepSec: 30,
     captions: [],
     accounts: [],
   };
@@ -2608,6 +2613,30 @@ function normalizeBulkConfig(raw) {
   next.followConcurrency = Number.isFinite(followConcurrency) ? Math.max(1, Math.min(6, followConcurrency)) : 1;
   const followJitterSec = Math.round(Number(next.followJitterSec ?? 4));
   next.followJitterSec = Number.isFinite(followJitterSec) ? Math.max(0, Math.min(120, followJitterSec)) : 4;
+
+  if (typeof next.followUrls === "string") next.followUrls = next.followUrls.split(/[\r\n,]+/g);
+  if (!Array.isArray(next.followUrls)) next.followUrls = [];
+  next.followUrls = next.followUrls
+    .map((u) => normalizeXStatusUrl(safeString(u).trim()))
+    .filter((u) => isLikelyXStatusUrl(u));
+  const followUrlsDedup = [];
+  const followUrlsSeen = new Set();
+  for (const u of next.followUrls) {
+    if (followUrlsSeen.has(u)) continue;
+    followUrlsSeen.add(u);
+    followUrlsDedup.push(u);
+    if (followUrlsDedup.length >= 2000) break;
+  }
+  next.followUrls = followUrlsDedup;
+
+  const followActionDelaySec = Math.round(Number(next.followActionDelaySec ?? 2));
+  next.followActionDelaySec = Number.isFinite(followActionDelaySec) ? Math.max(0, Math.min(600, followActionDelaySec)) : 2;
+  const followCooldownEvery = Math.round(Number(next.followCooldownEvery ?? 0));
+  next.followCooldownEvery = Number.isFinite(followCooldownEvery) ? Math.max(0, Math.min(200, followCooldownEvery)) : 0;
+  const followCooldownSec = Math.round(Number(next.followCooldownSec ?? 0));
+  next.followCooldownSec = Number.isFinite(followCooldownSec) ? Math.max(0, Math.min(3600, followCooldownSec)) : 0;
+  const followIdleSleepSec = Math.round(Number(next.followIdleSleepSec ?? 30));
+  next.followIdleSleepSec = Number.isFinite(followIdleSleepSec) ? Math.max(5, Math.min(3600, followIdleSleepSec)) : 30;
 
   // 代理按账号配置（account.proxy），不再使用全局默认/代理池
   delete next.defaultProxy;
