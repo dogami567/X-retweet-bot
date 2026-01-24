@@ -78,6 +78,13 @@ function localDateKey(date = new Date()) {
   return `${yyyy}-${mm}-${dd}`;
 }
 
+function msUntilNextLocalMidnight(date = new Date()) {
+  const d = date instanceof Date ? date : new Date();
+  const next = new Date(d);
+  next.setHours(24, 0, 0, 0);
+  return Math.max(0, next.getTime() - d.getTime());
+}
+
 function ensureBulkFollowDailyState(state) {
   const st = state && typeof state === "object" ? state : {};
   const today = localDateKey();
@@ -1796,6 +1803,7 @@ async function bulkFollowCommentersForAccount(account, tweetUrl, options = {}) {
     skipped: 0,
     warnings: 0,
     failed: 0,
+    endedBecause: "",
   };
 
   try {
@@ -2103,12 +2111,21 @@ async function bulkFollowCommentersForAccount(account, tweetUrl, options = {}) {
     };
 
     while (true) {
-      if (isBulkFollowStopRequested()) break;
-      if (summary.followed >= effectiveFollowLimit) break;
+      if (isBulkFollowStopRequested()) {
+        if (!summary.endedBecause) summary.endedBecause = "stopped";
+        break;
+      }
+      if (summary.followed >= effectiveFollowLimit) {
+        if (!summary.endedBecause) summary.endedBecause = "max_followed";
+        break;
+      }
 
       const state = upsertBulkState(a.id);
       ensureBulkFollowDailyState(state);
-      if (getBulkFollowRemaining(state) <= 0) break;
+      if (getBulkFollowRemaining(state) <= 0) {
+        if (!summary.endedBecause) summary.endedBecause = "daily_limit";
+        break;
+      }
 
       if (pending.length === 0) {
         await commentPage.bringToFront().catch(() => {});
@@ -2117,6 +2134,7 @@ async function bulkFollowCommentersForAccount(account, tweetUrl, options = {}) {
           addBulkLog(
             `[关注] 扫描轮次已达上限，提前结束 account=${safeString(a.name || a.id)} followed=${summary.followed}/${effectiveFollowLimit} scanned=${seen.size}`,
           );
+          if (!summary.endedBecause) summary.endedBecause = "max_rounds";
           break;
         }
 
@@ -2353,10 +2371,12 @@ async function bulkFollowCommentersForAccount(account, tweetUrl, options = {}) {
                   diag?.statusLinks || 0,
                 )} text=${safeString(diag?.text)}`,
               );
+              if (!summary.endedBecause) summary.endedBecause = "scanned0";
             } else {
               addBulkLog(
                 `[关注] 评论用户已耗尽/无新增，提前结束 account=${safeString(a.name || a.id)} followed=${summary.followed}/${effectiveFollowLimit} scanned=${seen.size}`,
               );
+              if (!summary.endedBecause) summary.endedBecause = "no_new";
             }
             break;
           }
@@ -2366,7 +2386,10 @@ async function bulkFollowCommentersForAccount(account, tweetUrl, options = {}) {
         }
       }
 
-      if (isBulkFollowStopRequested()) break;
+      if (isBulkFollowStopRequested()) {
+        if (!summary.endedBecause) summary.endedBecause = "stopped";
+        break;
+      }
       const target = safeString(pending.shift()).trim();
       if (!target) continue;
 
@@ -2456,7 +2479,10 @@ async function bulkFollowCommentersForAccount(account, tweetUrl, options = {}) {
         error: safeString(e?.message || e),
       }));
 
-      if (r.status === "stopped") break;
+      if (r.status === "stopped") {
+        if (!summary.endedBecause) summary.endedBecause = "stopped";
+        break;
+      }
 
       if (r.status === "already_following") {
         summary.skipped += 1;
@@ -2739,6 +2765,7 @@ async function runBulkFollowCommentersQueueLoop(options = {}) {
 
       ensureBulkFollowDailyState(state);
       if (!Number.isFinite(Number(state.followQueueIndex))) state.followQueueIndex = 0;
+      let emptyQueueLogged = false;
 
       // 启动抖动：避免同时打开浏览器/同时操作
       if (concurrency > 1 && followJitterSec > 0) {
@@ -2756,59 +2783,82 @@ async function runBulkFollowCommentersQueueLoop(options = {}) {
 
           const urls = Array.isArray(bulkConfig?.followUrls) ? bulkConfig.followUrls : [];
           if (urls.length === 0) {
-            postDelayMs = followIdleSleepSec * 1000;
-            continue;
-          }
-
-          const idx = Math.max(0, Math.round(Number(state.followQueueIndex) || 0)) % urls.length;
-          const url = safeString(urls[idx]).trim();
-          if (!url) {
-            state.followQueueIndex = (idx + 1) % urls.length;
-            postDelayMs = followIdleSleepSec * 1000;
-            continue;
-          }
-
-          bulkFollowJob.tweetUrl = url;
-          state.followQueueIndex = idx;
-          ensureBulkFollowDailyState(state);
-
-          state.followRunning = true;
-          state.followLastRunAt = nowIso();
-          state.followLastTweetUrl = url;
-          state.followDone = 0;
-          state.followSkipped = 0;
-          state.followWarnings = 0;
-          state.followFailed = 0;
-          state.followLastError = "";
-          state.followLastErrorAt = "";
-
-          const remainDaily = getBulkFollowRemaining(state);
-          const remain = Math.min(remainDaily, maxPerAccount);
-          if (remainDaily <= 0) {
-            addBulkLog(`[关注] 今日已达上限，暂停 account=${safeString(a.name || a.id)} today=${state.followDailyCount}/${BULK_FOLLOW_COMMENTERS_DAILY_LIMIT}`);
-            postDelayMs = followIdleSleepSec * 1000;
-          } else if (remain <= 0) {
-            addBulkLog(`[关注] 已达本次上限，跳过 account=${safeString(a.name || a.id)} perUrl=${maxPerAccount}`);
+            if (!emptyQueueLogged) {
+              emptyQueueLogged = true;
+              addBulkLog(
+                `[关注][DBG] URL 队列为空，进入 idle account=${safeString(a.name || a.id)} wait=${followIdleSleepSec}s`,
+              );
+            }
             postDelayMs = followIdleSleepSec * 1000;
           } else {
-            const r = await bulkFollowCommentersForAccount(a, url, {
-              remainDaily,
-              maxFollow: remain,
-              followWaitSec,
-              followActionDelaySec,
-              followCooldownEvery,
-              followCooldownSec,
-            });
-            state.followDone = Number(r?.followed || 0);
-            state.followSkipped = Number(r?.skipped || 0);
-            state.followWarnings = Number(r?.warnings || 0);
-            state.followFailed = Number(r?.failed || 0);
-            addBulkLog(
-              `[关注] 完成 account=${safeString(a.name || a.id)} url=${url} followed=${state.followDone} skipped=${state.followSkipped} warn=${state.followWarnings} failed=${state.followFailed} today=${state.followDailyCount}/${BULK_FOLLOW_COMMENTERS_DAILY_LIMIT}`,
-            );
-          }
+            emptyQueueLogged = false;
 
-          state.followQueueIndex = urls.length > 0 ? (idx + 1) % urls.length : 0;
+            const idx = Math.max(0, Math.round(Number(state.followQueueIndex) || 0)) % urls.length;
+            const url = safeString(urls[idx]).trim();
+            if (!url) {
+              state.followQueueIndex = (idx + 1) % urls.length;
+              postDelayMs = followIdleSleepSec * 1000;
+            } else {
+              bulkFollowJob.tweetUrl = url;
+              state.followQueueIndex = idx;
+              ensureBulkFollowDailyState(state);
+
+              state.followRunning = true;
+              state.followLastRunAt = nowIso();
+              state.followLastTweetUrl = url;
+              state.followDone = 0;
+              state.followSkipped = 0;
+              state.followWarnings = 0;
+              state.followFailed = 0;
+              state.followLastError = "";
+              state.followLastErrorAt = "";
+
+              const remainDaily = getBulkFollowRemaining(state);
+              const remain = Math.min(remainDaily, maxPerAccount);
+              if (remainDaily <= 0) {
+                const waitMs = Math.max(followIdleSleepSec * 1000, msUntilNextLocalMidnight() + randomIntInclusive(1000, 8000));
+                addBulkLog(
+                  `[关注] 今日已达上限，将等待到明天 account=${safeString(a.name || a.id)} wait=${Math.round(waitMs / 1000)}s today=${state.followDailyCount}/${BULK_FOLLOW_COMMENTERS_DAILY_LIMIT}`,
+                );
+                postDelayMs = waitMs;
+              } else if (remain <= 0) {
+                addBulkLog(`[关注] 已达本次上限，跳过 account=${safeString(a.name || a.id)} perUrl=${maxPerAccount}`);
+                postDelayMs = followIdleSleepSec * 1000;
+              } else {
+                const r = await bulkFollowCommentersForAccount(a, url, {
+                  remainDaily,
+                  maxFollow: remain,
+                  followWaitSec,
+                  followActionDelaySec,
+                  followCooldownEvery,
+                  followCooldownSec,
+                });
+                state.followDone = Number(r?.followed || 0);
+                state.followSkipped = Number(r?.skipped || 0);
+                state.followWarnings = Number(r?.warnings || 0);
+                state.followFailed = Number(r?.failed || 0);
+                addBulkLog(
+                  `[关注] 完成 account=${safeString(a.name || a.id)} url=${url} followed=${state.followDone} skipped=${state.followSkipped} warn=${state.followWarnings} failed=${state.followFailed} today=${state.followDailyCount}/${BULK_FOLLOW_COMMENTERS_DAILY_LIMIT}`,
+                );
+
+                const ended = safeString(r?.endedBecause).trim();
+                if (ended === "no_new" || ended === "scanned0") {
+                  postDelayMs = Math.max(postDelayMs, followIdleSleepSec * 1000);
+                }
+              }
+
+              const nextIdx = urls.length > 0 ? (idx + 1) % urls.length : 0;
+              state.followQueueIndex = nextIdx;
+              if (urls.length > 1) {
+                const nextUrl = safeString(urls[nextIdx]).trim();
+                if (nextUrl) {
+                  addBulkLog(
+                    `[关注][DBG] 切换 URL account=${safeString(a.name || a.id)} next=${nextUrl} idx=${nextIdx + 1}/${urls.length}`,
+                  );
+                }
+              }
+            }
+          }
         } catch (e) {
           state.followLastError = safeString(e?.message || e);
           state.followLastErrorAt = nowIso();
@@ -5343,9 +5393,6 @@ async function main() {
         // 传 tweetUrl 等价于“先追加到队列，再启动”
         const addRes = await appendBulkFollowUrls([url]);
         if (!addRes.ok) return res.status(400).json({ error: safeString(addRes.error), invalid: (addRes.invalid || []).slice(0, 50) });
-      } else {
-        const first = Array.isArray(bulkConfig?.followUrls) ? safeString(bulkConfig.followUrls[0]).trim() : "";
-        if (!first) return res.status(400).json({ error: "缺少 tweetUrl，且 URL 队列为空：请先追加链接或直接填写链接启动" });
       }
 
       const accounts = getBulkAccounts().filter((a) => Boolean(a?.followCommentersEnabled) && Boolean(safeString(a?.id).trim()));
