@@ -1051,6 +1051,140 @@ async function detectXLoggedIn(page) {
   return cookies.some((c) => c && (c.name === "auth_token" || c.name === "twid") && safeString(c.value).trim());
 }
 
+function detectXRestrictionKindFromText(text) {
+  const t = safeString(text).replace(/\s+/g, " ").trim().toLowerCase();
+  if (!t) return "";
+
+  // 说明：关键字尽量覆盖英文/中文常见提示，避免误判；匹配到就立刻触发“暂停退避”。
+  const hit = (kw) => t.includes(kw);
+
+  // Rate limit / 429
+  if (
+    hit("rate limited") ||
+    hit("rate limit") ||
+    hit("too many requests") ||
+    hit("http 429") ||
+    hit("429") ||
+    hit("请求过于频繁") ||
+    hit("访问过于频繁") ||
+    hit("操作过于频繁") ||
+    hit("操作太频繁") ||
+    hit("频率限制") ||
+    hit("限流")
+  ) {
+    return "rate_limited";
+  }
+
+  // Follow limit (无法继续关注更多账号)
+  if (
+    hit("unable to follow more accounts") ||
+    hit("can't follow more accounts") ||
+    hit("cannot follow more accounts") ||
+    hit("unable to follow") ||
+    hit("can't follow") ||
+    hit("cannot follow") ||
+    hit("follow limit") ||
+    hit("following limit") ||
+    hit("已达到关注上限") ||
+    hit("达到关注上限") ||
+    hit("关注上限") ||
+    hit("无法关注更多") ||
+    hit("无法再关注") ||
+    hit("关注太多")
+  ) {
+    return "follow_limited";
+  }
+
+  // Action blocked / suspicious / automated
+  if (
+    hit("temporarily restricted") ||
+    hit("temporarily limited") ||
+    hit("unusual activity") ||
+    hit("suspicious activity") ||
+    hit("looks like it might be automated") ||
+    hit("automated") ||
+    hit("please try again later") ||
+    hit("something went wrong") ||
+    hit("try reloading") ||
+    hit("暂时受限") ||
+    hit("暂时限制") ||
+    hit("暂时无法") ||
+    hit("异常活动") ||
+    hit("可疑活动") ||
+    hit("自动化") ||
+    hit("请稍后再试") ||
+    hit("出了点问题") ||
+    hit("请刷新")
+  ) {
+    return "action_blocked";
+  }
+
+  return "";
+}
+
+async function detectXActionRestriction(page) {
+  const p = page && typeof page.evaluate === "function" ? page : null;
+  if (!p) return null;
+
+  const payload = await pageEvaluateWithRetry(
+    p,
+    "detectXActionRestriction(text)",
+    () => {
+      const normalize = (v) => String(v || "").replace(/\s+/g, " ").trim();
+      const uniq = new Set();
+      const texts = [];
+
+      const push = (v) => {
+        const s = normalize(v);
+        if (!s) return;
+        if (uniq.has(s)) return;
+        uniq.add(s);
+        texts.push(s);
+      };
+
+      try {
+        const nodes = Array.from(
+          document.querySelectorAll(
+            '[role="alert"], [aria-live="assertive"], [aria-live="polite"], [data-testid="toast"], [role="dialog"]',
+          ),
+        );
+        for (const el of nodes.slice(0, 8)) {
+          push(el.innerText || el.textContent || "");
+        }
+      } catch {}
+
+      try {
+        const root =
+          document.querySelector('[data-testid="primaryColumn"]') ||
+          document.querySelector('main[role="main"]') ||
+          document.body;
+        const text = root ? root.innerText || root.textContent || "" : "";
+        push(String(text || "").slice(0, 1200));
+      } catch {}
+
+      return {
+        url: location.href || "",
+        title: document.title || "",
+        texts: texts.slice(0, 10),
+      };
+    },
+  ).catch(() => null);
+
+  const texts = Array.isArray(payload?.texts) ? payload.texts : [];
+  const combined = texts.map((s) => safeString(s).replace(/\s+/g, " ").trim()).filter(Boolean).join(" ");
+  const kind = detectXRestrictionKindFromText(combined);
+  if (!kind) return null;
+
+  const evidenceRaw = texts.find((t) => detectXRestrictionKindFromText(t) === kind) || combined;
+  const evidence = safeString(evidenceRaw).replace(/\s+/g, " ").trim().slice(0, 220);
+  return {
+    kind,
+    evidence,
+    url: safeString(payload?.url),
+    title: safeString(payload?.title),
+  };
+}
+
 function isBulkFollowStopRequested() {
   return bulkFollowStopRequested === true;
 }
@@ -1458,29 +1592,25 @@ async function followUserFromProfile(page, options = {}) {
         };
 
         const classifyState = (testid, textLower) => {
+          const t = String(textLower || "");
+          if (t) {
+            if (t.includes("following") || t.includes("unfollow") || t.includes("已关注") || t.includes("正在关注")) return "following";
+            if (
+              t.includes("pending") ||
+              t.includes("requested") ||
+              t.includes("request sent") ||
+              t.includes("已请求") ||
+              t.includes("等待批准") ||
+              t.includes("请求已发送")
+            ) {
+              return "requested";
+            }
+            if (t.includes("follow") || t.includes("关注")) return "not_following";
+          }
+
           const tid = String(testid || "");
           if (tid.endsWith("-unfollow")) return "following";
           if (tid.endsWith("-follow")) return "not_following";
-          if (!textLower) return "unknown";
-          if (
-            textLower.includes("following") ||
-            textLower.includes("unfollow") ||
-            textLower.includes("已关注") ||
-            textLower.includes("正在关注")
-          ) {
-            return "following";
-          }
-          if (
-            textLower.includes("pending") ||
-            textLower.includes("requested") ||
-            textLower.includes("request sent") ||
-            textLower.includes("已请求") ||
-            textLower.includes("等待批准") ||
-            textLower.includes("请求已发送")
-          ) {
-            return "requested";
-          }
-          if (textLower.includes("follow") || textLower.includes("关注")) return "not_following";
           return "unknown";
         };
 
@@ -1544,12 +1674,24 @@ async function followUserFromProfile(page, options = {}) {
 
         candidates.sort((a, b) => b.score - a.score);
         const best = candidates[0] || null;
+        const anyFollowing = candidates.some((c) => c && c.state === "following");
+        const anyRequested = candidates.some((c) => c && c.state === "requested");
+        const anyPositivePrimary = candidates.some(
+          (c) => c && (c.state === "following" || c.state === "requested") && c.inMain === true && c.inAside !== true,
+        );
+        const anyPositiveMatched = Boolean(
+          needleLower && candidates.some((c) => c && (c.state === "following" || c.state === "requested") && c.matchedTarget === true),
+        );
         return {
           ok: true,
           targetHandle: targetHandle ? String(targetHandle) : "",
           needle,
           candidates: candidates.length,
           matched: Boolean(best?.matchedTarget),
+          anyFollowing,
+          anyRequested,
+          anyPositivePrimary,
+          anyPositiveMatched,
           best: best
             ? {
                 state: best.state,
@@ -1577,15 +1719,37 @@ async function followUserFromProfile(page, options = {}) {
   // 多等一会儿：避免刚进入主页时按钮还没渲染出来（尤其是网络慢/代理/首次加载）
   const waitStart = Date.now();
   let snap = null;
+  let lastRestrictionCheckAt = 0;
+  let lastWaitLogAt = 0;
   while (Date.now() - waitStart < waitForButtonMs) {
     if (isBulkFollowStopRequested()) return { status: "stopped" };
+
+    const now = Date.now();
+    if (now - lastRestrictionCheckAt >= randomIntInclusive(1100, 1700)) {
+      lastRestrictionCheckAt = now;
+      // eslint-disable-next-line no-await-in-loop
+      const restriction = await detectXActionRestriction(page).catch(() => null);
+      if (restriction && restriction.kind) {
+        return { status: "restricted", kind: restriction.kind, evidence: restriction.evidence || "" };
+      }
+      if (isLoginLikeUrl(safeString(page.url()))) return { status: "login_required" };
+    }
+
     // eslint-disable-next-line no-await-in-loop
     snap = await getFollowSnapshot();
     if (snap?.best) {
       if (!targetHandle || snap.matched) break;
     }
     // eslint-disable-next-line no-await-in-loop
-    await sleepWithBulkFollowStop(280);
+    if (now - waitStart >= 5000 && now - lastWaitLogAt >= 8000) {
+      lastWaitLogAt = now;
+      addBulkLog(
+        `[关注][DBG] 等待关注按钮中 waited=${Math.round((now - waitStart) / 1000)}s target=${targetHandle ? `@${targetHandle}` : "(auto)"} candidates=${Number(
+          snap?.candidates || 0,
+        )} matched=${Boolean(snap?.matched)}`,
+      );
+    }
+    await sleepWithBulkFollowStop(randomIntInclusive(220, 520));
   }
 
   if (!snap?.best) return { status: "button_not_found" };
@@ -1627,24 +1791,25 @@ async function followUserFromProfile(page, options = {}) {
         };
 
         const classifyState = (testid, textLower) => {
+          const t = String(textLower || "");
+          if (t) {
+            if (t.includes("following") || t.includes("unfollow") || t.includes("已关注") || t.includes("正在关注")) return "following";
+            if (
+              t.includes("pending") ||
+              t.includes("requested") ||
+              t.includes("request sent") ||
+              t.includes("已请求") ||
+              t.includes("等待批准") ||
+              t.includes("请求已发送")
+            ) {
+              return "requested";
+            }
+            if (t.includes("follow") || t.includes("关注")) return "not_following";
+          }
+
           const tid = String(testid || "");
           if (tid.endsWith("-unfollow")) return "following";
           if (tid.endsWith("-follow")) return "not_following";
-          if (!textLower) return "unknown";
-          if (textLower.includes("following") || textLower.includes("unfollow") || textLower.includes("已关注") || textLower.includes("正在关注")) {
-            return "following";
-          }
-          if (
-            textLower.includes("pending") ||
-            textLower.includes("requested") ||
-            textLower.includes("request sent") ||
-            textLower.includes("已请求") ||
-            textLower.includes("等待批准") ||
-            textLower.includes("请求已发送")
-          ) {
-            return "requested";
-          }
-          if (textLower.includes("follow") || textLower.includes("关注")) return "not_following";
           return "unknown";
         };
 
@@ -1710,11 +1875,24 @@ async function followUserFromProfile(page, options = {}) {
     let stableSince = 0;
     let lastState = "";
     let sawPositive = false;
+    let lastRestrictionCheckAt2 = 0;
 
     while (Date.now() - confirmStart < confirmTimeoutMs) {
       if (isBulkFollowStopRequested()) return { status: "stopped", sawPositive };
+
+      const now = Date.now();
+      if (now - lastRestrictionCheckAt2 >= randomIntInclusive(1100, 1700)) {
+        lastRestrictionCheckAt2 = now;
+        // eslint-disable-next-line no-await-in-loop
+        const restriction = await detectXActionRestriction(page).catch(() => null);
+        if (restriction && restriction.kind) {
+          return { status: "restricted", kind: restriction.kind, evidence: restriction.evidence || "", sawPositive };
+        }
+        if (isLoginLikeUrl(safeString(page.url()))) return { status: "login_required", sawPositive };
+      }
+
       // eslint-disable-next-line no-await-in-loop
-      await sleepWithBulkFollowStop(260);
+      await sleepWithBulkFollowStop(randomIntInclusive(240, 520));
       // eslint-disable-next-line no-await-in-loop
       const s = await getFollowSnapshot();
       const st = safeString(s?.best?.state);
@@ -1762,19 +1940,23 @@ async function followUserFromProfile(page, options = {}) {
     if (confirm.status === "followed") return { status: "followed" };
     if (confirm.status === "requested") return { status: "requested" };
     if (confirm.status === "stopped") return { status: "stopped" };
+    if (confirm.status === "restricted") return { status: "restricted", kind: confirm.kind || "", evidence: confirm.evidence || "" };
+    if (confirm.status === "login_required") return { status: "login_required" };
 
     // 如果已经出现过“Following/Requested”，不要二次点击，避免误触取消关注/重复请求
     if (confirm.sawPositive) return { status: "clicked" };
 
     // 重试前再检查一次：如果仍显示 not_following 才允许继续点
     // eslint-disable-next-line no-await-in-loop
-    await sleepWithBulkFollowStop(900 + attempt * 250);
+    await sleepWithBulkFollowStop(randomIntInclusive(820, 1480) + attempt * randomIntInclusive(180, 320));
     // eslint-disable-next-line no-await-in-loop
     const s = await getFollowSnapshot();
     const st = safeString(s?.best?.state);
     if (targetHandle && s && !s.matched) return { status: "clicked" };
     if (st === "following") return { status: "followed" };
     if (st === "requested") return { status: "requested" };
+    const avoidRetry = targetHandle ? Boolean(s?.anyPositiveMatched) : Boolean(s?.anyPositivePrimary);
+    if (avoidRetry) return { status: "clicked" };
     if (st !== "not_following") return { status: "clicked" };
   }
 
@@ -1826,6 +2008,7 @@ async function bulkFollowCommentersForAccount(account, tweetUrl, options = {}) {
     warnings: 0,
     failed: 0,
     endedBecause: "",
+    backoffMs: 0,
   };
 
   try {
@@ -2246,6 +2429,26 @@ async function bulkFollowCommentersForAccount(account, tweetUrl, options = {}) {
                 `[关注][DBG] 扫描状态 rounds=${rounds} found=${Array.isArray(found) ? found.length : 0} added=${added} queued=${pending.length} seen=${seen.size} diag=unavailable`,
               );
             }
+
+            // 等待/滚动过程中如果触发了风控/限流提示，应立即暂停，避免继续“无意义滚动/重复操作”。
+            const restriction = await detectXActionRestriction(commentPage).catch(() => null);
+            if (restriction && restriction.kind) {
+              summary.failed += 1;
+              summary.warnings += 1;
+              summary.ok = false;
+              if (!summary.endedBecause) summary.endedBecause = restriction.kind;
+
+              const baseSec = followCooldownSec > 0 ? followCooldownSec : 180;
+              const backoffMs = Math.max(30_000, Math.min(3600_000, baseSec * 1000)) + randomIntInclusive(0, 30_000);
+              summary.backoffMs = Math.max(summary.backoffMs || 0, backoffMs);
+
+              addBulkLog(
+                `[关注][WARN] 评论区检测到风控/限流，暂停 account=${safeString(a.name || a.id)} kind=${safeString(restriction.kind)} wait=${Math.round(
+                  backoffMs / 1000,
+                )}s evidence=${safeString(restriction.evidence).replace(/\s+/g, " ").trim().slice(0, 120)}`,
+              );
+              break;
+            }
           }
 
           // 如果一直扫不到任何评论用户，但页面内容还在增长，就会出现“无限滚动”的错觉。
@@ -2503,6 +2706,33 @@ async function bulkFollowCommentersForAccount(account, tweetUrl, options = {}) {
 
       if (r.status === "stopped") {
         if (!summary.endedBecause) summary.endedBecause = "stopped";
+        break;
+      }
+
+      if (r.status === "login_required") {
+        summary.failed += 1;
+        summary.ok = false;
+        if (!summary.endedBecause) summary.endedBecause = "login_required";
+        addBulkLog(`[关注][WARN] 登录态失效/被跳转登录，停止本次执行 account=${safeString(a.name || a.id)} user=${display}`);
+        break;
+      }
+
+      if (r.status === "restricted") {
+        summary.failed += 1;
+        summary.warnings += 1;
+        summary.ok = false;
+        const kind = safeString(r.kind).trim() || "restricted";
+        if (!summary.endedBecause) summary.endedBecause = kind;
+
+        const baseSec = followCooldownSec > 0 ? followCooldownSec : 180;
+        const backoffMs = Math.max(30_000, Math.min(3600_000, baseSec * 1000)) + randomIntInclusive(0, 30_000);
+        summary.backoffMs = Math.max(summary.backoffMs || 0, backoffMs);
+
+        addBulkLog(
+          `[关注][WARN] 检测到风控/限流，暂停 account=${safeString(a.name || a.id)} user=${display} kind=${kind} wait=${Math.round(
+            backoffMs / 1000,
+          )}s evidence=${safeString(r.evidence).replace(/\s+/g, " ").trim().slice(0, 120)}`,
+        );
         break;
       }
 
@@ -2909,6 +3139,15 @@ async function runBulkFollowCommentersQueueLoop(options = {}) {
                   if (ended === "no_new" || ended === "scanned0") {
                     postDelayReason = "idle_no_new";
                     postDelayMs = Math.max(postDelayMs, followIdleSleepSec * 1000);
+                  } else if (ended === "rate_limited" || ended === "follow_limited" || ended === "action_blocked") {
+                    const hint = Math.max(0, Math.round(Number(r?.backoffMs) || 0));
+                    const baseSec = followCooldownSec > 0 ? followCooldownSec : 180;
+                    const fallback = Math.max(30_000, Math.min(3600_000, baseSec * 1000)) + randomIntInclusive(0, 30_000);
+                    postDelayReason = ended;
+                    postDelayMs = Math.max(postDelayMs, hint > 0 ? hint : fallback);
+                  } else if (ended === "login_required") {
+                    postDelayReason = "login_required";
+                    postDelayMs = Math.max(postDelayMs, 60_000 + randomIntInclusive(0, 15_000));
                   }
                 }
 
