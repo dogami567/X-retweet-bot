@@ -57,6 +57,9 @@ const BULK_LOG_LIMIT = 200;
 const QUEUE_MAX_ATTEMPTS = 5;
 const X_REQUEST_TIMEOUT_MS = 60_000;
 const BULK_FOLLOW_COMMENTERS_DAILY_LIMIT = 300;
+// 说明：用户经常“复制大图到目录”或“边下载边写入”，会导致扫描/选中时文件仍未写完。
+// 这里通过“最小稳定时间窗”避免选到半成品文件（仍可在后续扫描中被纳入）。
+const BULK_IMAGE_READY_MIN_AGE_MS = 2500;
 
 function nowIso() {
   return new Date().toISOString();
@@ -3831,6 +3834,7 @@ let bulkImagesCache = { dir: "", images: [], scannedAt: "" };
 let bulkImageWatcher = null;
 let bulkImageWatchDir = "";
 let bulkImageWatchDebounceTimer = null;
+let bulkImageStabilizeTimer = null;
 
 function ensureBulkAccountIds(cfgFile) {
   const next = cfgFile && typeof cfgFile === "object" ? cfgFile : {};
@@ -4026,6 +4030,7 @@ async function scanBulkImages(trigger) {
   }
 
   const images = [];
+  let tooFresh = 0;
   for (const ent of entries) {
     if (!ent?.isFile?.()) continue;
     const name = safeString(ent.name).trim();
@@ -4035,7 +4040,14 @@ async function scanBulkImages(trigger) {
     try {
       // eslint-disable-next-line no-await-in-loop
       const stat = await fs.stat(fullPath);
-      images.push({ name, size: Number(stat.size) || 0, mtimeMs: Number(stat.mtimeMs) || 0 });
+      const size = Number(stat.size) || 0;
+      const mtimeMs = Number(stat.mtimeMs) || 0;
+      const ageMs = mtimeMs > 0 ? Date.now() - mtimeMs : NaN;
+      if (size > 0 && Number.isFinite(ageMs) && ageMs >= 0 && ageMs < BULK_IMAGE_READY_MIN_AGE_MS) {
+        tooFresh += 1;
+        continue;
+      }
+      images.push({ name, size, mtimeMs });
     } catch {}
   }
 
@@ -4046,6 +4058,17 @@ async function scanBulkImages(trigger) {
 
   bulkImagesCache = { dir, images, scannedAt: nowIso() };
   if (added > 0) addBulkLog(`[图库] 检测到新增图片：added=${added} trigger=${safeString(trigger || "manual")}`);
+
+  // 如果发现“疑似仍在写入”的文件，延迟再扫一次，避免用户需要手动刷新
+  if (tooFresh > 0 && !bulkImageStabilizeTimer) {
+    const waitMs = Math.max(BULK_IMAGE_READY_MIN_AGE_MS, 1200);
+    addBulkLog(`[图库][DBG] 检测到图片仍在写入，稍后再扫描 count=${tooFresh} waitMs=${waitMs}`);
+    bulkImageStabilizeTimer = setTimeout(() => {
+      bulkImageStabilizeTimer = null;
+      scanBulkImages("stabilize").catch(() => {});
+    }, waitMs);
+  }
+
   return bulkImagesCache;
 }
 
@@ -4059,6 +4082,8 @@ function stopBulkImageWatcher() {
   bulkImageWatchDir = "";
   if (bulkImageWatchDebounceTimer) clearTimeout(bulkImageWatchDebounceTimer);
   bulkImageWatchDebounceTimer = null;
+  if (bulkImageStabilizeTimer) clearTimeout(bulkImageStabilizeTimer);
+  bulkImageStabilizeTimer = null;
 }
 
 function startBulkImageWatcher() {
@@ -4218,18 +4243,62 @@ async function bulkPostOnce(account, options = {}) {
   // 2. 准备媒体文件 (路径或buffer)
   const mediaItems = [];
   const mediaFilePaths = []; // For Puppeteer
+  const skippedImageNames = [];
   
   for (const name of pickedNames) {
     const filePath = path.join(imageDir, name);
-    mediaFilePaths.push(filePath);
     
-    // API模式才需要 Buffer
-    if (!useCookieMode) {
+    // Cookie/Browser 模式也需要尽量避免“半成品文件”（拷贝未完成/仍在写入）
+    if (useCookieMode) {
+      try {
         // eslint-disable-next-line no-await-in-loop
-        const buffer = await fs.readFile(filePath);
-        const mimeType = mimeTypeFromFileName(name) || "application/octet-stream";
-        mediaItems.push({ buffer, mimeType, fileName: name });
+        const stat = await fs.stat(filePath);
+        const mtimeMs = Number(stat.mtimeMs) || 0;
+        const ageMs = mtimeMs > 0 ? Date.now() - mtimeMs : NaN;
+        if (Number.isFinite(ageMs) && ageMs >= 0 && ageMs < BULK_IMAGE_READY_MIN_AGE_MS) {
+          throw new Error(`file not ready (ageMs=${Math.round(ageMs)})`);
+        }
+        mediaFilePaths.push(filePath);
+      } catch (e) {
+        skippedImageNames.push(name);
+        const code = safeString(e?.code).trim();
+        const errHint = code || safeErrorMessage(e);
+        addBulkLog(`[图库][WARN] 图片不可用，跳过：${safeString(name)} err=${errHint}`);
+      }
+      continue;
     }
+
+    // API模式需要 Buffer
+    try {
+      // eslint-disable-next-line no-await-in-loop
+      const buffer = await fs.readFile(filePath);
+      const mimeType = mimeTypeFromFileName(name) || "application/octet-stream";
+      mediaItems.push({ buffer, mimeType, fileName: name });
+    } catch (e) {
+      skippedImageNames.push(name);
+      const code = safeString(e?.code).trim();
+      const errHint = code || safeErrorMessage(e);
+      addBulkLog(`[图库][WARN] 图片读取失败，跳过：${safeString(name)} err=${errHint}`);
+    }
+  }
+
+  // 如果有图片因不可用被跳过，避免把它永久标记为“已用”（后续稳定后仍可被选中）
+  if (!a.dryRun && skippedImageNames.length > 0) {
+    const st = state && typeof state === "object" ? state : null;
+    if (st && Array.isArray(st.usedImageNames)) {
+      const bad = new Set(skippedImageNames.map((s) => safeString(s).trim()).filter(Boolean));
+      if (bad.size > 0) {
+        st.usedImageNames = st.usedImageNames.filter((n) => !bad.has(safeString(n).trim()));
+        st.usedImageUpdatedAt = nowIso();
+      }
+    }
+  }
+
+  // 如果图片都不可用且无文案，视为“跳过”而不是失败
+  const hasAnyMedia = useCookieMode ? mediaFilePaths.length > 0 : mediaItems.length > 0;
+  if (!caption && !hasAnyMedia) {
+    addBulkLog(`[发帖] 跳过：图片不可用且无文案 account=${safeString(a.name || a.id)}`);
+    return { skipped: true, reason: "empty_media_unavailable" };
   }
 
   // 3. 上传媒体
