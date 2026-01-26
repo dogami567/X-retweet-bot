@@ -482,6 +482,27 @@ async function followCommentersStart() {
   await saveConfig();
 
   const tweetUrl = byId("followTweetUrl")?.value?.trim() || "";
+  // 体验优化：很多人会直接在“URL 队列”里粘贴链接然后点“开始”，
+  // 但队列模式实际读取的是已保存的 followUrls。这里在 queue 模式下自动把输入框内容追加到队列。
+  if (!tweetUrl) {
+    const queueText = byId("followUrlsInput")?.value || "";
+    if (String(queueText).trim()) {
+      const addRes = await fetch("/api/bulk/follow-urls/add", {
+        method: "POST",
+        cache: "no-store",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ text: queueText }),
+      });
+      const contentType = addRes.headers.get("content-type") || "";
+      const data = contentType.includes("application/json") ? await addRes.json() : await addRes.text();
+      if (!addRes.ok) {
+        setJsonBox(data);
+        return;
+      }
+      const input = byId("followUrlsInput");
+      if (input) input.value = "";
+    }
+  }
   const maxPerAccount = Number(byId("followMaxPerAccount")?.value || 30);
   const followWaitSec = Number(byId("followWaitSec")?.value || 18);
   const followConcurrency = Number(byId("followConcurrency")?.value || 1);
