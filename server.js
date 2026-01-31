@@ -573,7 +573,7 @@ function defaultBulkConfig() {
     followConcurrency: 1,
     followJitterSec: 4,
     followUrls: [],
-    followActionDelaySec: 2,
+    followActionDelaySec: 0,
     followCooldownEvery: 0,
     followCooldownSec: 0,
     followIdleSleepSec: 30,
@@ -1537,6 +1537,8 @@ async function followUserFromProfile(page, options = {}) {
   const waitForButtonMs = Math.max(3000, Math.min(600_000, Math.round(Number(opt.waitForButtonMs) || 18_000)));
   const confirmTimeoutMs = Math.max(3000, Math.min(25_000, Math.round(Number(opt.confirmTimeoutMs) || 10_000)));
   const maxClickAttempts = Math.max(1, Math.min(3, Math.round(Number(opt.maxClickAttempts) || 2)));
+  const preClickDelayMsRaw = Number(opt.preClickDelayMs ?? 0);
+  const preClickDelayMs = Number.isFinite(preClickDelayMsRaw) ? Math.max(0, Math.min(600_000, Math.round(preClickDelayMsRaw))) : 0;
 
   const followBtnSel = '[data-testid$="-follow"]';
   const unfollowBtnSel = '[data-testid$="-unfollow"]';
@@ -1763,6 +1765,39 @@ async function followUserFromProfile(page, options = {}) {
   if (state0 === "following") return { status: "already_following" };
   if (state0 === "requested") return { status: "already_requested" };
   if (state0 !== "not_following") return { status: "button_not_found" };
+
+  // 仅在“确实需要点击关注”时才停顿：已关注/已请求会直接跳过（满足“关注过的不等待”）。
+  // 约定：preClickDelayMs=0 表示使用 1~2 秒随机停顿（更像真人）。
+  const effectivePreClickDelayMs = preClickDelayMs > 0 ? preClickDelayMs : randomIntInclusive(1100, 2400);
+  if (effectivePreClickDelayMs > 0) {
+    if (preClickDelayMs >= 10_000) {
+      addBulkLog(
+        `[关注][DBG] 未关注，停顿后再点关注 wait=${Math.round(effectivePreClickDelayMs / 1000)}s target=${targetHandle ? `@${targetHandle}` : "(auto)"}`,
+      );
+    }
+
+    const delayStart = Date.now();
+    let lastRestrictionCheckAt3 = 0;
+    while (Date.now() - delayStart < effectivePreClickDelayMs) {
+      if (isBulkFollowStopRequested()) return { status: "stopped" };
+      const now = Date.now();
+
+      if (now - lastRestrictionCheckAt3 >= randomIntInclusive(1100, 1700)) {
+        lastRestrictionCheckAt3 = now;
+        // eslint-disable-next-line no-await-in-loop
+        const restriction = await detectXActionRestriction(page).catch(() => null);
+        if (restriction && restriction.kind) {
+          return { status: "restricted", kind: restriction.kind, evidence: restriction.evidence || "" };
+        }
+        if (isLoginLikeUrl(safeString(page.url()))) return { status: "login_required" };
+      }
+
+      const remaining = Math.max(0, effectivePreClickDelayMs - (now - delayStart));
+      const chunk = Math.min(remaining, randomIntInclusive(450, 1200));
+      // eslint-disable-next-line no-await-in-loop
+      await sleepWithBulkFollowStop(chunk, 500);
+    }
+  }
 
   const clickOnce = async () => {
     return pageEvaluateWithRetry(
@@ -2212,7 +2247,6 @@ async function bulkFollowCommentersForAccount(account, tweetUrl, options = {}) {
       0,
       Math.min(3600, Math.round(Number(options.followCooldownSec ?? bulkConfig?.followCooldownSec ?? 0) || 0)),
     );
-    const followActionDelayMs = followActionDelaySec > 0 ? followActionDelaySec * 1000 : 0;
     const followCooldownMs = followCooldownEvery > 0 && followCooldownSec > 0 ? followCooldownSec * 1000 : 0;
     const effectiveFollowLimit = Math.max(1, Math.min(remainDaily || maxFollow, maxFollow));
     const authorFromUrl = extractStatusAuthorFromUrl(tweetUrl);
@@ -2699,7 +2733,11 @@ async function bulkFollowCommentersForAccount(account, tweetUrl, options = {}) {
         }
       } catch {}
 
-      const r = await followUserFromProfile(actionPage, { targetHandle, waitForButtonMs: followWaitSec * 1000 }).catch((e) => ({
+      const r = await followUserFromProfile(actionPage, {
+        targetHandle,
+        waitForButtonMs: followWaitSec * 1000,
+        preClickDelayMs: followActionDelaySec > 0 ? followActionDelaySec * 1000 : 0,
+      }).catch((e) => ({
         status: "error",
         error: safeString(e?.message || e),
       }));
@@ -2770,11 +2808,6 @@ async function bulkFollowCommentersForAccount(account, tweetUrl, options = {}) {
           `[关注] 已关注 account=${safeString(a.name || a.id)} user=${display} remain=${remainHint}/${effectiveFollowLimit} today=${state.followDailyCount}/${BULK_FOLLOW_COMMENTERS_DAILY_LIMIT}`,
         );
 
-        const actionDelayMs = followActionDelayMs > 0 ? followActionDelayMs : randomIntInclusive(1100, 2400);
-        setBulkFollowSleepState(state, followActionDelayMs > 0 ? "action_delay" : "action_delay_jitter", actionDelayMs);
-        // eslint-disable-next-line no-await-in-loop
-        await sleepWithBulkFollowStop(actionDelayMs);
-        clearBulkFollowSleepState(state);
         if (followCooldownMs > 0 && summary.followed > 0 && summary.followed % followCooldownEvery === 0) {
           addBulkLog(`[关注][DBG] 触发冷却 account=${safeString(a.name || a.id)} every=${followCooldownEvery} wait=${followCooldownSec}s`);
           setBulkFollowSleepState(state, "cooldown", followCooldownMs);
@@ -2799,11 +2832,6 @@ async function bulkFollowCommentersForAccount(account, tweetUrl, options = {}) {
           `[关注][WARN] 已发送关注请求（等待批准） account=${safeString(a.name || a.id)} user=${display} remain=${remainHint}/${effectiveFollowLimit} today=${state.followDailyCount}/${BULK_FOLLOW_COMMENTERS_DAILY_LIMIT}`,
         );
 
-        const actionDelayMs = followActionDelayMs > 0 ? followActionDelayMs : randomIntInclusive(1100, 2400);
-        setBulkFollowSleepState(state, followActionDelayMs > 0 ? "action_delay" : "action_delay_jitter", actionDelayMs);
-        // eslint-disable-next-line no-await-in-loop
-        await sleepWithBulkFollowStop(actionDelayMs);
-        clearBulkFollowSleepState(state);
         if (followCooldownMs > 0 && summary.followed > 0 && summary.followed % followCooldownEvery === 0) {
           addBulkLog(`[关注][DBG] 触发冷却 account=${safeString(a.name || a.id)} every=${followCooldownEvery} wait=${followCooldownSec}s`);
           setBulkFollowSleepState(state, "cooldown", followCooldownMs);
@@ -3019,7 +3047,7 @@ async function runBulkFollowCommentersQueueLoop(options = {}) {
   bulkFollowJob.accountsDone = 0;
 
   addBulkLog(
-    `[关注] 开始队列 accounts=${accounts.length} concurrency=${followConcurrency} jitter=${followJitterSec}s perUrl=本次每号${maxPerAccount} wait=${followWaitSec}s actionDelay=${followActionDelaySec}s cooldownEvery=${followCooldownEvery} cooldown=${followCooldownSec}s idle=${followIdleSleepSec}s`,
+    `[关注] 开始队列 accounts=${accounts.length} concurrency=${followConcurrency} jitter=${followJitterSec}s perUrl=本次每号${maxPerAccount} wait=${followWaitSec}s preDelay=${followActionDelaySec}s cooldownEvery=${followCooldownEvery} cooldown=${followCooldownSec}s idle=${followIdleSleepSec}s`,
   );
 
   try {
@@ -3263,8 +3291,8 @@ function normalizeBulkConfig(raw) {
   }
   next.followUrls = followUrlsDedup;
 
-  const followActionDelaySec = Math.round(Number(next.followActionDelaySec ?? 2));
-  next.followActionDelaySec = Number.isFinite(followActionDelaySec) ? Math.max(0, Math.min(600, followActionDelaySec)) : 2;
+  const followActionDelaySec = Math.round(Number(next.followActionDelaySec ?? 0));
+  next.followActionDelaySec = Number.isFinite(followActionDelaySec) ? Math.max(0, Math.min(600, followActionDelaySec)) : 0;
   const followCooldownEvery = Math.round(Number(next.followCooldownEvery ?? 0));
   next.followCooldownEvery = Number.isFinite(followCooldownEvery) ? Math.max(0, Math.min(200, followCooldownEvery)) : 0;
   const followCooldownSec = Math.round(Number(next.followCooldownSec ?? 0));

@@ -235,9 +235,9 @@
                          <div class="form-text small">进入用户主页后，最多等待 N 秒让「关注/已关注」按钮渲染出来或刷新；超时会跳过该用户。默认 18 秒；加载慢/风控可填 180（3 分钟）。</div>
                      </div>
                      <div class="col-12 col-lg-4">
-                         <label class="form-label small text-muted mb-1">关注后间隔（秒）</label>
+                         <label class="form-label small text-muted mb-1">点击关注前停顿（秒）</label>
                          <input class="form-control" type="number" id="followActionDelaySec" value="0" min="0" max="600">
-                         <div class="form-text small">每次成功关注后等待 N 秒再继续；填 0 表示随机约 1～2 秒（更像真人）。</div>
+                         <div class="form-text small">仅在需要点击「关注」时生效：如果已关注/已请求会直接跳过不等待；填 N 则先停顿 N 秒再点关注；填 0 表示随机约 1～2 秒。</div>
                      </div>
                      <div class="col-12 col-lg-4">
                          <label class="form-label small text-muted mb-1">并行账号数</label>
