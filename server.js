@@ -1220,6 +1220,52 @@ function clearBulkFollowSleepState(state) {
   st.followSleepUntil = "";
 }
 
+function upsertBulkFollowUrlStat(url) {
+  const u = normalizeXStatusUrl(url);
+  if (!u) return null;
+  const existing = bulkFollowUrlStats.get(u);
+  if (existing && typeof existing === "object") return existing;
+  const next = {
+    url: u,
+    runs: 0,
+    lastRunAt: "",
+    lastAccountId: "",
+    lastAccount: "",
+    lastFollowed: 0,
+    lastSkipped: 0,
+    lastWarnings: 0,
+    lastFailed: 0,
+    lastEndedBecause: "",
+    lastBackoffSec: 0,
+  };
+  bulkFollowUrlStats.set(u, next);
+  return next;
+}
+
+function recordBulkFollowUrlStat(url, account, result) {
+  const u = normalizeXStatusUrl(url);
+  if (!u) return;
+  const st = upsertBulkFollowUrlStat(u);
+  if (!st) return;
+
+  const a = account && typeof account === "object" ? account : {};
+  const r = result && typeof result === "object" ? result : {};
+
+  st.runs = Math.max(0, Math.round(Number(st.runs) || 0)) + 1;
+  st.lastRunAt = nowIso();
+  st.lastAccountId = safeString(a?.id).trim();
+  st.lastAccount = safeString(a?.name || a?.id).trim();
+  st.lastFollowed = Math.max(0, Math.round(Number(r?.followed) || 0));
+  st.lastSkipped = Math.max(0, Math.round(Number(r?.skipped) || 0));
+  st.lastWarnings = Math.max(0, Math.round(Number(r?.warnings) || 0));
+  st.lastFailed = Math.max(0, Math.round(Number(r?.failed) || 0));
+  st.lastEndedBecause = safeString(r?.endedBecause).trim();
+  const backoffMs = Math.max(0, Math.round(Number(r?.backoffMs) || 0));
+  st.lastBackoffSec = backoffMs > 0 ? Math.max(0, Math.round(backoffMs / 1000)) : 0;
+
+  bulkFollowUrlStatsUpdatedAt = nowIso();
+}
+
 function resetBulkFollowJob() {
   bulkFollowJob = {
     running: false,
@@ -2955,6 +3001,7 @@ async function runBulkFollowCommenters(tweetUrl, options = {}) {
         state.followSkipped = Number(r?.skipped || 0);
         state.followWarnings = Number(r?.warnings || 0);
         state.followFailed = Number(r?.failed || 0);
+        recordBulkFollowUrlStat(url, a, r);
         addBulkLog(
           `[关注] 完成 account=${safeString(a.name || a.id)} followed=${state.followDone} skipped=${state.followSkipped} warn=${state.followWarnings} failed=${state.followFailed} today=${state.followDailyCount}/${BULK_FOLLOW_COMMENTERS_DAILY_LIMIT}`,
         );
@@ -3097,6 +3144,7 @@ async function runBulkFollowCommentersQueueLoop(options = {}) {
             bulkFollowJob.currentAccountId = id;
             bulkFollowJob.currentAccount = safeString(a.name || a.id);
             bulkFollowJob.currentUrl = "";
+            bulkFollowJob.tweetUrl = "";
 
             const urls = Array.isArray(bulkConfig?.followUrls) ? bulkConfig.followUrls : [];
             if (urls.length === 0) {
@@ -3159,6 +3207,7 @@ async function runBulkFollowCommentersQueueLoop(options = {}) {
                 state.followSkipped = Number(r?.skipped || 0);
                 state.followWarnings = Number(r?.warnings || 0);
                 state.followFailed = Number(r?.failed || 0);
+                recordBulkFollowUrlStat(url, a, r);
                 addBulkLog(
                   `[关注] 完成 account=${safeString(a.name || a.id)} url=${url} followed=${state.followDone} skipped=${state.followSkipped} warn=${state.followWarnings} failed=${state.followFailed} today=${state.followDailyCount}/${BULK_FOLLOW_COMMENTERS_DAILY_LIMIT}`,
                 );
@@ -3256,6 +3305,79 @@ async function appendBulkFollowUrls(urlsOrText) {
   bulkFollowUrlsUpdatedAt = nowIso();
 
   return { ok: true, added, total: bulkConfig.followUrls.length, urls: bulkConfig.followUrls };
+}
+
+async function replaceBulkFollowUrls(urlsOrText) {
+  const parsed = parseXStatusUrlsInput(urlsOrText);
+  if (parsed.invalid.length > 0) {
+    return {
+      ok: false,
+      error: `存在非法链接（必须包含 /status/）：${parsed.invalid.slice(0, 10).join(", ")}${parsed.invalid.length > 10 ? " ..." : ""}`,
+      invalid: parsed.invalid,
+    };
+  }
+
+  if (!bulkConfigFile || typeof bulkConfigFile !== "object") bulkConfigFile = defaultBulkConfig();
+  bulkConfigFile.followUrls = parsed.valid;
+  await writeJson(BULK_CONFIG_PATH, bulkConfigFile);
+  bulkConfig = normalizeBulkConfig(bulkConfigFile);
+  bulkFollowUrlsUpdatedAt = nowIso();
+
+  // 队列变化后把各账号的队列指针收敛到合法范围，避免异常（例如从 100 条删到 3 条）。
+  const len = Array.isArray(bulkConfig?.followUrls) ? bulkConfig.followUrls.length : 0;
+  for (const st of bulkStates.values()) {
+    if (!st || typeof st !== "object") continue;
+    if (!Number.isFinite(Number(st.followQueueIndex))) st.followQueueIndex = 0;
+    const idx = Math.max(0, Math.round(Number(st.followQueueIndex) || 0));
+    st.followQueueIndex = len > 0 ? idx % len : 0;
+  }
+
+  return { ok: true, total: bulkConfig.followUrls.length, urls: bulkConfig.followUrls };
+}
+
+async function removeBulkFollowUrl(urlOrIndex) {
+  const existing = Array.isArray(bulkConfig?.followUrls) ? bulkConfig.followUrls : [];
+  const next = [...existing];
+
+  let removed = 0;
+  if (typeof urlOrIndex === "number" && Number.isFinite(urlOrIndex)) {
+    const idx = Math.max(0, Math.min(next.length - 1, Math.round(urlOrIndex)));
+    if (idx >= 0 && idx < next.length) {
+      next.splice(idx, 1);
+      removed = 1;
+    }
+  } else {
+    const url = normalizeXStatusUrl(urlOrIndex);
+    if (url) {
+      const before = next.length;
+      const filtered = next.filter((u) => safeString(u).trim() !== url);
+      removed = Math.max(0, before - filtered.length);
+      next.splice(0, next.length, ...filtered);
+    }
+  }
+
+  if (!bulkConfigFile || typeof bulkConfigFile !== "object") bulkConfigFile = defaultBulkConfig();
+  bulkConfigFile.followUrls = next;
+  await writeJson(BULK_CONFIG_PATH, bulkConfigFile);
+  bulkConfig = normalizeBulkConfig(bulkConfigFile);
+  bulkFollowUrlsUpdatedAt = nowIso();
+
+  // 清理已移除 URL 的运行态（仅内存统计，不影响队列）
+  const keep = new Set(bulkConfig.followUrls || []);
+  for (const key of bulkFollowUrlStats.keys()) {
+    if (!keep.has(key)) bulkFollowUrlStats.delete(key);
+  }
+
+  // 收敛各账号队列指针
+  const len = bulkConfig.followUrls.length;
+  for (const st of bulkStates.values()) {
+    if (!st || typeof st !== "object") continue;
+    if (!Number.isFinite(Number(st.followQueueIndex))) st.followQueueIndex = 0;
+    const idx = Math.max(0, Math.round(Number(st.followQueueIndex) || 0));
+    st.followQueueIndex = len > 0 ? idx % len : 0;
+  }
+
+  return { ok: true, removed, total: bulkConfig.followUrls.length, urls: bulkConfig.followUrls };
 }
 
 function normalizeBulkConfig(raw) {
@@ -4096,6 +4218,8 @@ let bulkFollowJob = {
 };
 let bulkFollowStopRequested = false;
 let bulkFollowUrlsUpdatedAt = "";
+let bulkFollowUrlStatsUpdatedAt = "";
+const bulkFollowUrlStats = new Map(); // url -> { url, runs, lastRunAt, lastAccountId, lastAccount, lastFollowed, lastSkipped, lastWarnings, lastFailed, lastEndedBecause, lastBackoffSec }
 let bulkScanTimer = null;
 let bulkImagesCache = { dir: "", images: [], scannedAt: "" };
 let bulkImageWatcher = null;
@@ -5809,6 +5933,82 @@ async function main() {
     }
   });
 
+  app.get("/api/bulk/follow-urls", async (req, res) => {
+    const limitRaw = Number(req.query?.limit ?? 2000);
+    const limit = Number.isFinite(limitRaw) ? Math.max(1, Math.min(2000, Math.round(limitRaw))) : 2000;
+
+    const urls = Array.isArray(bulkConfig?.followUrls) ? bulkConfig.followUrls : [];
+    const shown = urls.slice(0, limit);
+    const currentUrl =
+      bulkFollowJob?.mode === "queue"
+        ? safeString(bulkFollowJob?.currentUrl).trim()
+        : safeString(bulkFollowJob?.tweetUrl).trim();
+
+    const stats = shown.map((u) => {
+      const key = normalizeXStatusUrl(u);
+      if (!key) return null;
+      const st = bulkFollowUrlStats.get(key);
+      return st && typeof st === "object" ? st : null;
+    });
+
+    return res.json({
+      ok: true,
+      total: urls.length,
+      urls: shown,
+      truncated: urls.length > shown.length,
+      updatedAt: safeString(bulkFollowUrlsUpdatedAt).trim(),
+      currentUrl,
+      statsUpdatedAt: safeString(bulkFollowUrlStatsUpdatedAt).trim(),
+      stats,
+    });
+  });
+
+  app.post("/api/bulk/follow-urls/set", async (req, res) => {
+    try {
+      const input =
+        Array.isArray(req.body) || typeof req.body === "string"
+          ? req.body
+          : req.body?.urls ?? req.body?.text ?? req.body?.value ?? req.body?.raw ?? "";
+
+      const r = await replaceBulkFollowUrls(input);
+      if (!r.ok) return res.status(400).json({ error: safeString(r.error), invalid: (r.invalid || []).slice(0, 50) });
+
+      addBulkLog(`[关注] 已覆盖 URL 队列 total=${r.total}`);
+      return res.json({ ok: true, total: r.total, urls: r.urls, updatedAt: bulkFollowUrlsUpdatedAt });
+    } catch (e) {
+      const err = safeString(e?.message || e);
+      addBulkLog(`[关注] 覆盖 URL 失败：${err}`);
+      return res.status(500).json({ error: err });
+    }
+  });
+
+  app.post("/api/bulk/follow-urls/remove", async (req, res) => {
+    try {
+      const url = safeString(req.body?.url).trim();
+      const index = Number(req.body?.index);
+      const r = await removeBulkFollowUrl(url ? url : Number.isFinite(index) ? index : "");
+      addBulkLog(`[关注] 已删除 URL removed=${r.removed} total=${r.total}`);
+      return res.json({ ok: true, removed: r.removed, total: r.total, urls: r.urls, updatedAt: bulkFollowUrlsUpdatedAt });
+    } catch (e) {
+      const err = safeString(e?.message || e);
+      addBulkLog(`[关注] 删除 URL 失败：${err}`);
+      return res.status(500).json({ error: err });
+    }
+  });
+
+  app.post("/api/bulk/follow-urls/clear", async (_req, res) => {
+    try {
+      const r = await replaceBulkFollowUrls([]);
+      if (!r.ok) return res.status(500).json({ error: safeString(r.error) });
+      addBulkLog("[关注] 已清空 URL 队列");
+      return res.json({ ok: true, total: r.total, urls: r.urls, updatedAt: bulkFollowUrlsUpdatedAt });
+    } catch (e) {
+      const err = safeString(e?.message || e);
+      addBulkLog(`[关注] 清空 URL 失败：${err}`);
+      return res.status(500).json({ error: err });
+    }
+  });
+
   app.post("/api/bulk/follow-commenters/start", async (req, res) => {
     try {
       const maxPerAccount = Math.round(Number(req.body?.maxPerAccount) || 30);
@@ -5882,11 +6082,17 @@ async function main() {
     const sleepRemainingSec =
       Number.isFinite(sleepUntilMs) && sleepUntilMs > Date.now() ? Math.max(0, Math.round((sleepUntilMs - Date.now()) / 1000)) : 0;
 
+    const currentUrl =
+      bulkFollowJob?.mode === "queue"
+        ? safeString(bulkFollowJob?.currentUrl).trim()
+        : safeString(bulkFollowJob?.tweetUrl).trim();
+
     const queue = {
       urlsTotal: followUrls.length,
       urls: followUrls.slice(0, 200),
+      urlsTruncated: followUrls.length > 200,
       updatedAt: safeString(bulkFollowUrlsUpdatedAt).trim(),
-      currentUrl: safeString(bulkFollowJob?.currentUrl || bulkFollowJob?.tweetUrl).trim(),
+      currentUrl,
       currentAccountId,
       currentAccount,
       sleepReason,

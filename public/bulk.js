@@ -477,6 +477,89 @@ function setFollowQueueHint(queue) {
   el.textContent = `队列：${total}${currentText}${updatedText}`;
 }
 
+function formatFollowUrlStat(stat) {
+  const s = stat && typeof stat === "object" ? stat : null;
+  if (!s) return "未运行";
+  const lastAt = s.lastRunAt ? new Date(s.lastRunAt).toLocaleString() : "";
+  const acc = String(s.lastAccount || "").trim();
+  const followed = Number(s.lastFollowed ?? 0);
+  const skipped = Number(s.lastSkipped ?? 0);
+  const warnings = Number(s.lastWarnings ?? 0);
+  const failed = Number(s.lastFailed ?? 0);
+  const ended = String(s.lastEndedBecause || "").trim();
+  const backoff = Number(s.lastBackoffSec ?? 0);
+  const endedText = ended ? ` | end=${ended}` : "";
+  const backoffText = backoff > 0 ? ` | 退避=${backoff}s` : "";
+  return `上次：${lastAt || "-"}${acc ? ` | 账号=${acc}` : ""} | followed=${followed} skip=${skipped} warn=${warnings} fail=${failed}${endedText}${backoffText}`;
+}
+
+function setFollowUrlsList(payload) {
+  const listEl = byId("followUrlsList");
+  const hintEl = byId("followUrlsListHint");
+  if (!listEl) return;
+
+  const p = payload && typeof payload === "object" ? payload : {};
+  const total = Number(p.total ?? 0);
+  const urls = Array.isArray(p.urls) ? p.urls : [];
+  const stats = Array.isArray(p.stats) ? p.stats : [];
+  const currentUrl = String(p.currentUrl || "").trim();
+  const shown = urls.length;
+  const truncated = p.truncated === true;
+
+  if (hintEl) {
+    hintEl.textContent = total > 0 ? `显示 ${shown}/${total}${truncated ? "（已截断）" : ""}` : "队列为空";
+  }
+
+  if (urls.length === 0) {
+    listEl.innerHTML = `<div class="list-group-item text-center text-muted small py-3">队列为空</div>`;
+    return;
+  }
+
+  listEl.innerHTML = urls
+    .slice(0, 500)
+    .map((u, idx) => {
+      const url = String(u || "").trim();
+      const isCurrent = Boolean(currentUrl && url && currentUrl === url);
+      const badge = isCurrent ? `<span class="badge bg-success ms-2">当前</span>` : "";
+      const statText = formatFollowUrlStat(stats[idx] || null);
+      const encoded = escapeHtml(url);
+      return `<div class="list-group-item py-2">
+        <div class="d-flex justify-content-between align-items-start gap-2">
+          <div class="flex-grow-1 text-truncate">
+            <span class="text-muted me-1">${idx + 1}.</span>
+            <a class="mono" href="${encoded}" target="_blank" rel="noreferrer" title="${encoded}">${encoded}</a>
+            ${badge}
+          </div>
+          <button class="btn btn-xs btn-outline-danger" type="button" data-follow-url-remove="${encoded}" title="从队列删除">删</button>
+        </div>
+        <div class="small text-muted mt-1">${escapeHtml(statText)}</div>
+      </div>`;
+    })
+    .join("");
+
+  listEl.querySelectorAll("[data-follow-url-remove]").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      const url = btn.getAttribute("data-follow-url-remove") || "";
+      if (!url) return;
+      const res = await api("/api/bulk/follow-urls/remove", {
+        method: "POST",
+        body: JSON.stringify({ url }),
+      });
+      setJsonBox(res);
+      await refreshFollowUrlsList({ silent: true }).catch(() => {});
+      await followCommentersStatus({ silent: true }).catch(() => {});
+    });
+  });
+}
+
+async function refreshFollowUrlsList(options = {}) {
+  const silent = options.silent === true;
+  const data = await api("/api/bulk/follow-urls?limit=500");
+  if (!silent) setJsonBox(data);
+  setFollowUrlsList(data);
+  return data;
+}
+
 async function followCommentersStart() {
   // 确保账号勾选/代理等最新配置已落盘，否则服务端拿到的还是旧配置
   await saveConfig();
@@ -519,6 +602,7 @@ async function followCommentersStart() {
   showLogsTab();
   await refreshLogs({ silent: true }).catch(() => {});
   await refreshStatus({ silent: true }).catch(() => {});
+  await refreshFollowUrlsList({ silent: true }).catch(() => {});
 }
 
 async function followCommentersStop() {
@@ -534,6 +618,7 @@ async function followCommentersStatus(options = {}) {
   if (!silent) setJsonBox(res);
   setFollowJobHint(res?.job || null);
   setFollowQueueHint(res?.queue || null);
+  await refreshFollowUrlsList({ silent: true }).catch(() => {});
   return res;
 }
 
@@ -565,6 +650,35 @@ async function followUrlsAdd() {
   showLogsTab();
   await refreshLogs({ silent: true }).catch(() => {});
   await followCommentersStatus({ silent: true }).catch(() => {});
+  await refreshFollowUrlsList({ silent: true }).catch(() => {});
+}
+
+async function followUrlsSet() {
+  await saveConfig();
+  const text = byId("followUrlsInput")?.value || "";
+  if (!String(text).trim()) {
+    const ok = confirm("输入框为空：将覆盖为“空队列”（等同清空），确认？");
+    if (!ok) return;
+  }
+  const res = await api("/api/bulk/follow-urls/set", {
+    method: "POST",
+    body: JSON.stringify({ text }),
+  });
+  setJsonBox(res);
+  showLogsTab();
+  await followCommentersStatus({ silent: true }).catch(() => {});
+  await refreshFollowUrlsList({ silent: true }).catch(() => {});
+}
+
+async function followUrlsClear() {
+  const ok = confirm("确认清空 URL 队列？");
+  if (!ok) return;
+  await saveConfig();
+  const res = await api("/api/bulk/follow-urls/clear", { method: "POST" });
+  setJsonBox(res);
+  showLogsTab();
+  await followCommentersStatus({ silent: true }).catch(() => {});
+  await refreshFollowUrlsList({ silent: true }).catch(() => {});
 }
 
 async function refreshDebug(options = {}) {
@@ -989,6 +1103,9 @@ bind("btnTestXAuth", "click", testXAuth);
 bind("btnRunOnce", "click", runOnce);
 
 bind("btnFollowUrlsAdd", "click", followUrlsAdd);
+bind("btnFollowUrlsSet", "click", followUrlsSet);
+bind("btnFollowUrlsClear", "click", followUrlsClear);
+bind("btnFollowUrlsRefresh", "click", () => refreshFollowUrlsList({ silent: false }));
 bind("btnFollowCommentersStart", "click", followCommentersStart);
 bind("btnFollowCommentersStop", "click", followCommentersStop);
 bind("btnFollowCommentersStatus", "click", () => followCommentersStatus({ silent: false }));

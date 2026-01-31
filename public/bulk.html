@@ -211,9 +211,19 @@
                          <textarea class="form-control mono" id="followUrlsInput" rows="3" placeholder="一行一个：https://x.com/.../status/..."></textarea>
                          <div class="d-flex flex-wrap gap-2 mt-2">
                              <button class="btn btn-sm btn-outline-primary" id="btnFollowUrlsAdd" type="button"><i class="bi bi-plus-circle me-1"></i>追加到队列</button>
+                             <button class="btn btn-sm btn-outline-primary" id="btnFollowUrlsSet" type="button"><i class="bi bi-check2-circle me-1"></i>覆盖队列</button>
+                             <button class="btn btn-sm btn-outline-danger" id="btnFollowUrlsClear" type="button"><i class="bi bi-trash3 me-1"></i>清空队列</button>
+                             <button class="btn btn-sm btn-outline-secondary" id="btnFollowUrlsRefresh" type="button" title="刷新队列列表"><i class="bi bi-list-ul me-1"></i>刷新队列</button>
                              <button class="btn btn-sm btn-outline-secondary" id="btnFollowCommentersStatus" type="button" title="刷新状态"><i class="bi bi-arrow-repeat me-1"></i>刷新状态</button>
                          </div>
-                         <div class="form-text small">运行中追加不会打断；重复链接会自动去重。</div>
+                         <div class="form-text small">追加/覆盖会立即生效（运行中也不打断）；重复链接会自动去重。</div>
+                         <div class="mt-2">
+                             <div class="d-flex justify-content-between align-items-center">
+                                 <div class="small fw-bold text-secondary">队列列表</div>
+                                 <div class="small text-muted" id="followUrlsListHint">-</div>
+                             </div>
+                             <div class="list-group mt-2" id="followUrlsList" style="max-height: 240px; overflow: auto;"></div>
+                         </div>
                      </div>
                      <div class="col-12 col-lg-8">
                          <label class="form-label small text-muted mb-1">推文链接（可选：仅跑这一条）</label>
