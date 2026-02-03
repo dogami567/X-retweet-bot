@@ -205,6 +205,34 @@
                  <div class="small text-muted mb-2">
                      支持 URL 队列：可一次填多条 /status/ 链接，运行中也可追加；点击开始后会按队列顺序轮转并持续运行（每天每号最多 300）。
                  </div>
+                 <div class="row g-2 mb-3">
+                     <div class="col-12">
+                         <label class="form-label small text-muted mb-1">关键词采集（可选：自动补充 URL 队列）</label>
+                         <textarea class="form-control mono" id="harvestKeywordsText" rows="2" placeholder="一行一个关键词，例如：互关 / web3 / ai"></textarea>
+                         <div class="d-flex flex-wrap gap-2 mt-2 align-items-center">
+                             <select class="form-select form-select-sm" id="harvestMode" style="max-width: 160px;">
+                                 <option value="live">最新</option>
+                                 <option value="top">热门</option>
+                             </select>
+                             <div class="input-group input-group-sm" style="max-width: 220px;">
+                                 <span class="input-group-text text-muted">每词最多</span>
+                                 <input class="form-control" type="number" id="harvestLimitPerKeyword" value="20" min="1" max="200">
+                             </div>
+                             <div class="form-check form-check-inline mb-0">
+                                 <input class="form-check-input" type="checkbox" id="harvestEnabled">
+                                 <label class="form-check-label small text-muted" for="harvestEnabled">每天自动采集</label>
+                             </div>
+                             <div class="form-check form-check-inline mb-0">
+                                 <input class="form-check-input" type="checkbox" id="harvestAutoStart" checked>
+                                 <label class="form-check-label small text-muted" for="harvestAutoStart">采集后自动开始</label>
+                             </div>
+                             <button class="btn btn-sm btn-outline-secondary" id="btnHarvestOnce" type="button"><i class="bi bi-search me-1"></i>采集一次</button>
+                             <button class="btn btn-sm btn-outline-primary" id="btnHarvestAndStart" type="button"><i class="bi bi-lightning-charge me-1"></i>采集并开始</button>
+                             <button class="btn btn-sm btn-outline-secondary" id="btnHarvestStatus" type="button"><i class="bi bi-info-circle me-1"></i>采集状态</button>
+                         </div>
+                         <div class="form-text small" id="harvestHint">提示：采集到的推文链接会自动去重并追加到 URL 队列；已采集过的推文（按 ID）不会重复入队。</div>
+                     </div>
+                 </div>
                  <div class="row g-2">
                      <div class="col-12">
                          <label class="form-label small text-muted mb-1">URL 队列（多行，一行一个）</label>
@@ -270,6 +298,22 @@
                          <label class="form-label small text-muted mb-1">并行抖动（秒）</label>
                          <input class="form-control" type="number" id="followJitterSec" value="4" min="0" max="120">
                          <div class="form-text small">默认 4 秒（随机 0~4 秒）。</div>
+                     </div>
+                 </div>
+                 <div class="row g-2 mt-2">
+                     <div class="col-12 col-lg-4">
+                         <label class="form-label small text-muted mb-1">每访问主页 N 次后冷却</label>
+                         <input class="form-control" type="number" id="followVisitCooldownEvery" value="0" min="0" max="1000">
+                         <div class="form-text small">统计“进入用户主页”的次数（命中缓存跳过不计）。默认 0（不启用）。</div>
+                     </div>
+                     <div class="col-12 col-lg-4">
+                         <label class="form-label small text-muted mb-1">访问冷却时长（秒）</label>
+                         <input class="form-control" type="number" id="followVisitCooldownSec" value="0" min="0" max="3600">
+                         <div class="form-text small">配合上面使用：每访问 N 次主页后暂停 M 秒。用于避免“连续打开几十个主页”。</div>
+                     </div>
+                     <div class="col-12 col-lg-4">
+                         <label class="form-label small text-muted mb-1">已关注去重（自动）</label>
+                         <div class="form-text small">脚本会按账号记录“已关注/已请求/受保护”的用户，后续遇到会直接跳过不再打开主页。</div>
                      </div>
                  </div>
                  <div class="form-text small" id="followQueueHint">队列：-</div>

@@ -2,6 +2,7 @@ node_modules/
 data/config.json
 data/monitor_db.json
 data/bulk_config.json
+data/bulk_state.json
 data/bulk-images/
 data/browser-profile/
 data/browser-profiles/
@@ -21,3 +22,5 @@ X-get2put-exe.zip
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
+test-results/
+playwright-report/

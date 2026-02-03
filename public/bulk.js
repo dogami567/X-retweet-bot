@@ -223,6 +223,14 @@ function applyBaseFormToConfig() {
   config.followActionDelaySec = Number(byId("followActionDelaySec")?.value || 0);
   config.followCooldownEvery = Number(byId("followCooldownEvery")?.value || 0);
   config.followCooldownSec = Number(byId("followCooldownSec")?.value || 0);
+  config.followVisitCooldownEvery = Number(byId("followVisitCooldownEvery")?.value || 0);
+  config.followVisitCooldownSec = Number(byId("followVisitCooldownSec")?.value || 0);
+
+  config.harvestKeywordsText = String(byId("harvestKeywordsText")?.value || "").trim();
+  config.harvestMode = String(byId("harvestMode")?.value || "live").trim();
+  config.harvestLimitPerKeyword = Number(byId("harvestLimitPerKeyword")?.value || 20);
+  config.harvestEnabled = Boolean(byId("harvestEnabled")?.checked);
+  config.harvestAutoStart = Boolean(byId("harvestAutoStart")?.checked);
 }
 
 function renderBaseForm() {
@@ -240,6 +248,21 @@ function renderBaseForm() {
   if (followCooldownEveryEl) followCooldownEveryEl.value = String(config.followCooldownEvery ?? 0);
   const followCooldownSecEl = byId("followCooldownSec");
   if (followCooldownSecEl) followCooldownSecEl.value = String(config.followCooldownSec ?? 0);
+  const visitEveryEl = byId("followVisitCooldownEvery");
+  if (visitEveryEl) visitEveryEl.value = String(config.followVisitCooldownEvery ?? 0);
+  const visitSecEl = byId("followVisitCooldownSec");
+  if (visitSecEl) visitSecEl.value = String(config.followVisitCooldownSec ?? 0);
+
+  const harvestTextEl = byId("harvestKeywordsText");
+  if (harvestTextEl) harvestTextEl.value = String(config.harvestKeywordsText || "");
+  const harvestModeEl = byId("harvestMode");
+  if (harvestModeEl) harvestModeEl.value = String(config.harvestMode || "live");
+  const harvestLimitEl = byId("harvestLimitPerKeyword");
+  if (harvestLimitEl) harvestLimitEl.value = String(config.harvestLimitPerKeyword ?? 20);
+  const harvestEnabledEl = byId("harvestEnabled");
+  if (harvestEnabledEl) harvestEnabledEl.checked = Boolean(config.harvestEnabled);
+  const harvestAutoStartEl = byId("harvestAutoStart");
+  if (harvestAutoStartEl) harvestAutoStartEl.checked = config.harvestAutoStart !== false;
 }
 
 function renderCaptionList() {
@@ -366,6 +389,11 @@ async function loadConfig() {
   if (!Number.isFinite(Number(config.followActionDelaySec))) config.followActionDelaySec = 0;
   if (!Number.isFinite(Number(config.followCooldownEvery))) config.followCooldownEvery = 0;
   if (!Number.isFinite(Number(config.followCooldownSec))) config.followCooldownSec = 0;
+  if (!Number.isFinite(Number(config.followVisitCooldownEvery))) config.followVisitCooldownEvery = 0;
+  if (!Number.isFinite(Number(config.followVisitCooldownSec))) config.followVisitCooldownSec = 0;
+  if (!Number.isFinite(Number(config.harvestLimitPerKeyword))) config.harvestLimitPerKeyword = 20;
+  if (!config.harvestMode) config.harvestMode = "live";
+  if (config.harvestAutoStart === undefined) config.harvestAutoStart = true;
 
   renderBaseForm();
   renderCaptionList();
@@ -387,6 +415,11 @@ async function saveConfig() {
   if (!Number.isFinite(Number(config.followActionDelaySec))) config.followActionDelaySec = 0;
   if (!Number.isFinite(Number(config.followCooldownEvery))) config.followCooldownEvery = 0;
   if (!Number.isFinite(Number(config.followCooldownSec))) config.followCooldownSec = 0;
+  if (!Number.isFinite(Number(config.followVisitCooldownEvery))) config.followVisitCooldownEvery = 0;
+  if (!Number.isFinite(Number(config.followVisitCooldownSec))) config.followVisitCooldownSec = 0;
+  if (!Number.isFinite(Number(config.harvestLimitPerKeyword))) config.harvestLimitPerKeyword = 20;
+  if (!config.harvestMode) config.harvestMode = "live";
+  if (config.harvestAutoStart === undefined) config.harvestAutoStart = true;
   renderBaseForm();
   renderCaptionList();
   renderAccountsList();
@@ -475,6 +508,56 @@ function setFollowQueueHint(queue) {
   const currentText = currentUrl ? ` | 当前：${currentUrl}` : "";
   const updatedText = updatedAtText ? ` | 更新：${updatedAtText}` : "";
   el.textContent = `队列：${total}${currentText}${updatedText}`;
+}
+
+function setHarvestHint(payload) {
+  const el = byId("harvestHint");
+  if (!el) return;
+
+  const p = payload && typeof payload === "object" ? payload : {};
+  const job = p.job && typeof p.job === "object" ? p.job : {};
+  const harvest = p.harvest && typeof p.harvest === "object" ? p.harvest : {};
+
+  const running = Boolean(job.running);
+  const mode = String(job.mode || "").trim();
+  const keywords = Array.isArray(job.keywords) ? job.keywords.length : 0;
+  const added = Number(job.added ?? harvest.lastAdded ?? 0);
+  const lastRunAt = harvest.lastRunAt ? new Date(harvest.lastRunAt).toLocaleString() : "";
+  const lastErr = String(harvest.lastError || job.lastError || "").trim();
+  const dailyKey = String(harvest.lastDailyKey || "").trim();
+
+  const modeText = mode === "top" ? "热门" : mode === "live" ? "最新" : mode ? mode : "-";
+  const runText = lastRunAt ? `上次：${lastRunAt}` : "上次：-";
+  const dailyText = dailyKey ? ` | 每日：${dailyKey}` : "";
+  const addedText = Number.isFinite(added) ? ` | 新增：${added}` : "";
+  const kwText = keywords > 0 ? ` | 关键词：${keywords}` : "";
+  const errText = lastErr ? ` | 错误：${lastErr}` : "";
+
+  el.textContent = `${running ? "采集中…" : "采集状态"} | 模式：${modeText}${kwText} | ${runText}${dailyText}${addedText}${errText}`;
+}
+
+async function harvestStatus(options = {}) {
+  const silent = options.silent === true;
+  const data = await api("/api/bulk/search-harvest/status");
+  if (!silent) setJsonBox(data);
+  setHarvestHint(data);
+  return data;
+}
+
+async function harvestRun(autoStart) {
+  const keywordsText = String(byId("harvestKeywordsText")?.value || "").trim();
+  const mode = String(byId("harvestMode")?.value || "live").trim();
+  const limitPerKeyword = Number(byId("harvestLimitPerKeyword")?.value || 20);
+  const maxPerAccount = Number(byId("followMaxPerAccount")?.value || 30);
+
+  const res = await api("/api/bulk/search-harvest/run", {
+    method: "POST",
+    body: JSON.stringify({ keywordsText, mode, limitPerKeyword, autoStart: Boolean(autoStart), maxPerAccount }),
+  });
+  setJsonBox(res);
+  await harvestStatus({ silent: true }).catch(() => {});
+  await refreshFollowUrlsList({ silent: true }).catch(() => {});
+  await followCommentersStatus({ silent: true }).catch(() => {});
 }
 
 function formatFollowUrlStat(stat) {
@@ -1109,6 +1192,9 @@ bind("btnFollowUrlsRefresh", "click", () => refreshFollowUrlsList({ silent: fals
 bind("btnFollowCommentersStart", "click", followCommentersStart);
 bind("btnFollowCommentersStop", "click", followCommentersStop);
 bind("btnFollowCommentersStatus", "click", () => followCommentersStatus({ silent: false }));
+bind("btnHarvestOnce", "click", () => harvestRun(false));
+bind("btnHarvestAndStart", "click", () => harvestRun(true));
+bind("btnHarvestStatus", "click", () => harvestStatus({ silent: false }));
 
 bind("btnRefreshImages", "click", () => refreshImages({ silent: false }));
 bind("btnRefreshStatus", "click", () => refreshStatus({ silent: false }));
@@ -1218,6 +1304,7 @@ await refreshDebug({ silent: true }).catch(() => {});
 await refreshStatus({ silent: true }).catch(() => {});
 await refreshImages({ silent: true }).catch(() => {});
 await refreshLogs({ silent: true }).catch(() => {});
+await harvestStatus({ silent: true }).catch(() => {});
 
 setInterval(() => refreshLogs({ silent: true }).catch(() => {}), 2000);
 setInterval(() => refreshStatus({ silent: true }).catch(() => {}), 5000);

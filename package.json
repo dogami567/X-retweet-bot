@@ -11,7 +11,8 @@
     "package:exe": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/package-exe.ps1",
     "release:exe": "npm run build:exe && npm run package:exe",
     "core-test": "node scripts/core-test.mjs",
-    "smoke": "node scripts/smoke-test.mjs"
+    "smoke": "node scripts/smoke-test.mjs",
+    "test:e2e": "playwright test"
   },
   "dependencies": {
     "axios": "^1.11.0",
@@ -25,6 +26,7 @@
     "twitter-api-v2": "^1.28.0"
   },
   "devDependencies": {
+    "@playwright/test": "^1.58.1",
     "pkg": "^5.8.1"
   },
   "pkg": {

@@ -44,6 +44,7 @@ const CONFIG_PATH = path.join(DATA_DIR, "config.json");
 const CONFIG_EXAMPLE_PATH = path.join(DATA_DIR, "config.example.json");
 const DB_PATH = path.join(DATA_DIR, "monitor_db.json");
 const BULK_CONFIG_PATH = path.join(DATA_DIR, "bulk_config.json");
+const BULK_STATE_PATH = path.join(DATA_DIR, "bulk_state.json");
 const BULK_IMAGES_DEFAULT_DIR = path.join(DATA_DIR, "bulk-images");
 const DOWNLOAD_DIR = path.join(DATA_DIR, "downloads");
 const PUBLIC_DIR = (() => {
@@ -577,6 +578,19 @@ function defaultBulkConfig() {
     followCooldownEvery: 0,
     followCooldownSec: 0,
     followIdleSleepSec: 30,
+    // 访问节流：用于“怕一下子连续访问很多主页导致账号更容易被限制”的情况
+    // 0 表示不启用
+    followVisitCooldownEvery: 0,
+    followVisitCooldownSec: 0,
+    // 账号一对一“已关注/已请求/受保护”等缓存：命中后不再访问主页，直接跳过
+    followSkipCacheEnabled: true,
+    followSkipCacheMax: 20000,
+    // 关键词采集：从 X 搜索结果采集 /status/ URL，并自动追加到 URL 队列
+    harvestKeywordsText: "",
+    harvestMode: "live", // live=最新, top=热门
+    harvestLimitPerKeyword: 20,
+    harvestEnabled: false, // 每天自动采集
+    harvestAutoStart: true, // 采集后自动开始关注（队列模式）
     captions: [],
     accounts: [],
   };
@@ -2294,6 +2308,15 @@ async function bulkFollowCommentersForAccount(account, tweetUrl, options = {}) {
       Math.min(3600, Math.round(Number(options.followCooldownSec ?? bulkConfig?.followCooldownSec ?? 0) || 0)),
     );
     const followCooldownMs = followCooldownEvery > 0 && followCooldownSec > 0 ? followCooldownSec * 1000 : 0;
+    const followVisitCooldownEvery = Math.max(
+      0,
+      Math.min(1000, Math.round(Number(options.followVisitCooldownEvery ?? bulkConfig?.followVisitCooldownEvery ?? 0) || 0)),
+    );
+    const followVisitCooldownSec = Math.max(
+      0,
+      Math.min(3600, Math.round(Number(options.followVisitCooldownSec ?? bulkConfig?.followVisitCooldownSec ?? 0) || 0)),
+    );
+    const followVisitCooldownMs = followVisitCooldownEvery > 0 && followVisitCooldownSec > 0 ? followVisitCooldownSec * 1000 : 0;
     const effectiveFollowLimit = Math.max(1, Math.min(remainDaily || maxFollow, maxFollow));
     const authorFromUrl = extractStatusAuthorFromUrl(tweetUrl);
     let excludeAuthor = authorFromUrl;
@@ -2702,6 +2725,32 @@ async function bulkFollowCommentersForAccount(account, tweetUrl, options = {}) {
       const isUrlTarget = /^https?:\/\//i.test(target);
       const profileUrl = isUrlTarget ? target : isPathTarget ? `https://x.com${target}` : `https://x.com/${target.replace(/^@/, "")}`;
       const display = isUrlTarget ? target : isPathTarget ? target : `@${target.replace(/^@/, "")}`;
+      ensureBulkFollowSeenStore(state);
+      const handleForCache = (() => {
+        if (!profileUrl) return "";
+        try {
+          const pathname = new URL(profileUrl).pathname || "";
+          const parts = pathname.split("/").filter(Boolean);
+          if (parts.length < 1) return "";
+          if (parts[0].toLowerCase() === "i") return "";
+          return normalizeHandleKey(parts[0]);
+        } catch {
+          return "";
+        }
+      })();
+
+      if (handleForCache && shouldSkipProfileVisitByCache(state, handleForCache)) {
+        summary.skipped += 1;
+        addBulkLog(
+          `[关注][DBG] 命中缓存，跳过主页 account=${safeString(a.name || a.id)} user=@${handleForCache} cached=${getBulkFollowSeenStatus(
+            state,
+            handleForCache,
+          )}`,
+        );
+        // 小抖动，避免“瞬间刷掉一大串”看起来很异常
+        await sleepWithBulkFollowStop(randomIntInclusive(80, 220));
+        continue;
+      }
 
       if (!actionPage) {
         actionPage = await browser.newPage();
@@ -2750,6 +2799,18 @@ async function bulkFollowCommentersForAccount(account, tweetUrl, options = {}) {
         }
       }
 
+      // 记录“确实访问过主页”的计数，用于突发情况恢复 + 访问节流
+      state.followVisitedProfiles = Math.max(0, Math.round(Number(state.followVisitedProfiles) || 0)) + 1;
+      markBulkStateDirty("visited_profile");
+      if (followVisitCooldownMs > 0 && state.followVisitedProfiles > 0 && state.followVisitedProfiles % followVisitCooldownEvery === 0) {
+        addBulkLog(
+          `[关注][DBG] 触发访问冷却 account=${safeString(a.name || a.id)} every=${followVisitCooldownEvery} wait=${followVisitCooldownSec}s`,
+        );
+        setBulkFollowSleepState(state, "visit_cooldown", followVisitCooldownMs);
+        await sleepWithBulkFollowStop(followVisitCooldownMs);
+        clearBulkFollowSleepState(state);
+      }
+
       await sleepWithBulkFollowStop(randomIntInclusive(800, 1400));
 
       if (isLoginLikeUrl(actionPage.url())) {
@@ -2761,6 +2822,7 @@ async function bulkFollowCommentersForAccount(account, tweetUrl, options = {}) {
         summary.skipped += 1;
         summary.warnings += 1;
         addBulkLog(`[关注][WARN] 受保护账号，跳过 account=${safeString(a.name || a.id)} user=${display}`);
+        if (handleForCache) recordBulkFollowSeenStatus(state, handleForCache, "protected");
         continue;
       }
 
@@ -2824,6 +2886,7 @@ async function bulkFollowCommentersForAccount(account, tweetUrl, options = {}) {
         summary.skipped += 1;
         summary.warnings += 1;
         addBulkLog(`[关注][WARN] 已关注过，跳过 account=${safeString(a.name || a.id)} user=${display}`);
+        if (handleForCache) recordBulkFollowSeenStatus(state, handleForCache, "already_following");
         continue;
       }
 
@@ -2831,6 +2894,7 @@ async function bulkFollowCommentersForAccount(account, tweetUrl, options = {}) {
         summary.skipped += 1;
         summary.warnings += 1;
         addBulkLog(`[关注][WARN] 已请求过关注（等待批准），跳过 account=${safeString(a.name || a.id)} user=${display}`);
+        if (handleForCache) recordBulkFollowSeenStatus(state, handleForCache, "already_requested");
         continue;
       }
 
@@ -2843,12 +2907,13 @@ async function bulkFollowCommentersForAccount(account, tweetUrl, options = {}) {
 
       if (r.status === "followed") {
         summary.followed += 1;
+        if (handleForCache) recordBulkFollowSeenStatus(state, handleForCache, "followed");
         if (summary.followed >= effectiveFollowLimit) {
           addBulkLog(`[关注] 已达本次上限 account=${safeString(a.name || a.id)} limit=${effectiveFollowLimit}`);
         }
-        const state = upsertBulkState(a.id);
         ensureBulkFollowDailyState(state);
         state.followDailyCount = Math.max(0, Math.round(Number(state.followDailyCount) || 0)) + 1;
+        markBulkStateDirty("follow_daily_count");
         const remainHint = Math.max(0, effectiveFollowLimit - summary.followed);
         addBulkLog(
           `[关注] 已关注 account=${safeString(a.name || a.id)} user=${display} remain=${remainHint}/${effectiveFollowLimit} today=${state.followDailyCount}/${BULK_FOLLOW_COMMENTERS_DAILY_LIMIT}`,
@@ -2867,12 +2932,13 @@ async function bulkFollowCommentersForAccount(account, tweetUrl, options = {}) {
       if (r.status === "requested") {
         summary.followed += 1;
         summary.warnings += 1;
+        if (handleForCache) recordBulkFollowSeenStatus(state, handleForCache, "requested");
         if (summary.followed >= effectiveFollowLimit) {
           addBulkLog(`[关注] 已达本次上限 account=${safeString(a.name || a.id)} limit=${effectiveFollowLimit}`);
         }
-        const state = upsertBulkState(a.id);
         ensureBulkFollowDailyState(state);
         state.followDailyCount = Math.max(0, Math.round(Number(state.followDailyCount) || 0)) + 1;
+        markBulkStateDirty("follow_daily_count");
         const remainHint = Math.max(0, effectiveFollowLimit - summary.followed);
         addBulkLog(
           `[关注][WARN] 已发送关注请求（等待批准） account=${safeString(a.name || a.id)} user=${display} remain=${remainHint}/${effectiveFollowLimit} today=${state.followDailyCount}/${BULK_FOLLOW_COMMENTERS_DAILY_LIMIT}`,
@@ -3230,6 +3296,7 @@ async function runBulkFollowCommentersQueueLoop(options = {}) {
 
               const nextIdx = urls.length > 0 ? (idx + 1) % urls.length : 0;
               state.followQueueIndex = nextIdx;
+              markBulkStateDirty("queue_index");
               if (urls.length > 1) {
                 const nextUrl = safeString(urls[nextIdx]).trim();
                 if (nextUrl) {
@@ -3267,6 +3334,339 @@ async function runBulkFollowCommentersQueueLoop(options = {}) {
     if (isBulkFollowStopRequested()) addBulkLog("[关注] 已停止");
     else addBulkLog("[关注] 全部账号已完成");
   }
+}
+
+function statusIdFromUrl(statusUrl) {
+  const u = safeString(statusUrl).trim();
+  const m = u.match(/\/status\/(\d+)/i);
+  return m ? safeString(m[1]).trim() : "";
+}
+
+async function collectStatusUrlsFromSearch(page, keyword, mode, limitPerKeyword) {
+  const q = safeString(keyword).trim();
+  const f = safeString(mode).trim().toLowerCase() === "top" ? "top" : "live";
+  const limit = Math.max(1, Math.min(200, Math.round(Number(limitPerKeyword) || 20)));
+  if (!q) return [];
+
+  const url = `https://x.com/search?q=${encodeURIComponent(q)}&src=typed_query&f=${encodeURIComponent(f)}`;
+  addBulkLog(`[采集][DBG] 打开搜索 q=${q} mode=${f} url=${url}`);
+
+  try {
+    await page.goto(url, { waitUntil: "networkidle2", timeout: 60_000 });
+  } catch {
+    await page.goto(url, { waitUntil: "domcontentloaded", timeout: 60_000 });
+  }
+  if (isLoginLikeUrl(page.url())) throw new Error("未登录：请先在任意账号里点“打开浏览器登录”完成登录");
+
+  // 给搜索结果一点渲染时间（x.com 经常 domcontentloaded 但列表还没出来）
+  await sleep(1200);
+  await page.waitForSelector("article", { timeout: 15_000 }).catch(() => {});
+
+  // 常见瞬态错误：显示 “Something went wrong. Try reloading.” → 点 Retry
+  for (let i = 0; i < 3; i += 1) {
+    // eslint-disable-next-line no-await-in-loop
+    const hasRetry = await page
+      .evaluate(() => {
+        const text = (document.body ? document.body.innerText || "" : "").toLowerCase();
+        return text.includes("something went wrong") && text.includes("retry");
+      })
+      .catch(() => false);
+    if (!hasRetry) break;
+    // eslint-disable-next-line no-await-in-loop
+    const clicked = await page
+      .evaluate(() => {
+        const btn = Array.from(document.querySelectorAll("div[role=button],button")).find((el) => {
+          const t = (el.innerText || "").trim().toLowerCase();
+          return t === "retry";
+        });
+        if (!btn) return false;
+        btn.click();
+        return true;
+      })
+      .catch(() => false);
+    addBulkLog(`[采集][DBG] 检测到错误页，已尝试点击 Retry clicked=${String(clicked)}`);
+    // eslint-disable-next-line no-await-in-loop
+    await sleep(1500);
+  }
+
+  // 常见故障：代理不可用/静态资源被拦截 → x.com 会显示 “JavaScript is disabled”
+  const jsDisabled = await page
+    .evaluate(() => {
+      const text = (document.body ? document.body.innerText || "" : "").toLowerCase();
+      return text.includes("javascript is disabled") || text.includes("enable javascript");
+    })
+    .catch(() => false);
+  if (jsDisabled) {
+    throw new Error("搜索页脚本未加载（检测到 JS disabled）。请检查账号 Proxy 是否可用，或先清空 Proxy 再试。");
+  }
+
+  const found = new Set();
+  let noNewRounds = 0;
+  const maxRounds = 60;
+  const maxNoNewRounds = 8;
+
+  for (let i = 0; i < maxRounds; i += 1) {
+    if (isBulkFollowStopRequested()) break;
+    if (found.size >= limit) break;
+
+    // eslint-disable-next-line no-await-in-loop
+    const links = await page
+      .evaluate(() => {
+        const out = [];
+        const anchors = Array.from(document.querySelectorAll('article a[href*="/status/"]'));
+        for (const a of anchors) {
+          const href = a.getAttribute("href") || a.href || "";
+          if (!href) continue;
+          // 只保留“看起来像推文详情页”的链接，避免把别的乱七八糟的 /status/ 片段捞进来
+          const h = String(href || "");
+          if (!/\/status\/\d+/i.test(h) && !/\/i\/status\/\d+/i.test(h)) continue;
+          out.push(href);
+        }
+        return out;
+      })
+      .catch(() => []);
+
+    const before = found.size;
+    for (const href of Array.isArray(links) ? links : []) {
+      const norm = normalizeXStatusUrl(href);
+      if (!norm || !isLikelyXStatusUrl(norm)) continue;
+      found.add(norm);
+      if (found.size >= limit) break;
+    }
+
+    if (found.size === before) noNewRounds += 1;
+    else noNewRounds = 0;
+    if (noNewRounds >= maxNoNewRounds) break;
+
+    // eslint-disable-next-line no-await-in-loop
+    await page.evaluate(() => window.scrollBy(0, Math.floor(window.innerHeight * 0.85))).catch(() => {});
+    // eslint-disable-next-line no-await-in-loop
+    await sleep(randomIntInclusive(800, 1400));
+  }
+
+  // 兜底：某些 X 页面在 DOM 中不暴露推文详情 <a href>，但 innerHTML/脚本里仍包含 /status/<id>
+  if (found.size === 0) {
+    const ids = await page
+      .evaluate((max) => {
+        const html = String(document.documentElement ? document.documentElement.innerHTML || "" : "");
+        const re = /\/(?:i\/)?status\/(\d+)/gi;
+        const out = [];
+        const seen = new Set();
+        let m;
+        while ((m = re.exec(html))) {
+          const id = String(m[1] || "").trim();
+          if (!id || seen.has(id)) continue;
+          seen.add(id);
+          out.push(id);
+          if (out.length >= max) break;
+        }
+        return out;
+      }, Math.max(20, limit))
+      .catch(() => []);
+
+    for (const id of Array.isArray(ids) ? ids : []) {
+      const u = normalizeXStatusUrl(`https://x.com/i/status/${safeString(id).trim()}`);
+      if (!u || !isLikelyXStatusUrl(u)) continue;
+      found.add(u);
+      if (found.size >= limit) break;
+    }
+    addBulkLog(`[采集][DBG] DOM 未找到 status 链接，已启用 HTML 兜底 ids=${Array.isArray(ids) ? ids.length : 0}`);
+  }
+
+  return Array.from(found);
+}
+
+async function runBulkHarvestAndMaybeStartFollow(options = {}) {
+  const opt = options && typeof options === "object" ? options : {};
+  const keywords = Array.isArray(opt.keywords)
+    ? opt.keywords
+    : parseHarvestKeywords(opt.keywordsText ?? bulkConfig?.harvestKeywordsText ?? "");
+  const mode = safeString(opt.mode ?? bulkConfig?.harvestMode ?? "live").trim().toLowerCase() === "top" ? "top" : "live";
+  const limitPerKeyword = Math.max(
+    1,
+    Math.min(200, Math.round(Number(opt.limitPerKeyword ?? bulkConfig?.harvestLimitPerKeyword ?? 20) || 20)),
+  );
+  const autoStart = opt.autoStart === undefined ? Boolean(bulkConfig?.harvestAutoStart) : Boolean(opt.autoStart);
+  const trigger = safeString(opt.trigger || "manual").trim() || "manual";
+  const startMaxPerAccount = Math.max(1, Math.min(BULK_FOLLOW_COMMENTERS_DAILY_LIMIT, Math.round(Number(opt.maxPerAccount) || 30)));
+
+  if (bulkSearchHarvestJob?.running) throw new Error("采集任务正在运行中");
+  if (bulkFollowJob?.running) throw new Error("关注任务运行中：为避免浏览器 Profile 冲突，请先停止关注任务再采集");
+  if (keywords.length === 0) throw new Error("请先填写关键词（可多行）");
+
+  const accounts = getBulkAccounts().filter((a) => Boolean(a?.followCommentersEnabled) && Boolean(safeString(a?.id).trim()));
+  const pick = accounts.find((a) => Boolean(safeString(a?.x?.profileDir).trim()));
+  if (!pick) throw new Error("没有可用账号：请至少有 1 个账号勾选“关注评论”，并完成浏览器登录（有 Profile）");
+
+  const exe = findLocalBrowser();
+  if (!exe) throw new Error("采集需要本地 Chrome/Edge。");
+
+  const profileDirValue = safeString(pick?.x?.profileDir).trim();
+  const profileDir = resolveAppDirPath(profileDirValue);
+  if (!profileDir) throw new Error("Profile 目录解析失败");
+
+  const proxyUrl = getBulkProxyUrl(pick);
+
+  bulkSearchHarvestJob.running = true;
+  bulkSearchHarvestJob.startedAt = nowIso();
+  bulkSearchHarvestJob.finishedAt = "";
+  bulkSearchHarvestJob.keywords = keywords;
+  bulkSearchHarvestJob.mode = mode;
+  bulkSearchHarvestJob.limitPerKeyword = limitPerKeyword;
+  bulkSearchHarvestJob.added = 0;
+  bulkSearchHarvestJob.totalQueue = Array.isArray(bulkConfig?.followUrls) ? bulkConfig.followUrls.length : 0;
+  bulkSearchHarvestJob.lastError = "";
+
+  addBulkLog(
+    `[采集] 开始 trigger=${trigger} account=${safeString(pick.name || pick.id)} keywords=${keywords.length} mode=${mode} limitPerKeyword=${limitPerKeyword}`,
+  );
+
+  const args = [
+    "--disable-blink-features=AutomationControlled",
+    "--no-first-run",
+    "--no-default-browser-check",
+    "--disable-infobars",
+    "--window-position=20,20",
+    "--window-size=1280,800",
+  ];
+  if (proxyUrl) args.push(`--proxy-server=${proxyUrl}`);
+
+  const browser = await puppeteer.launch({
+    executablePath: exe,
+    headless: false,
+    defaultViewport: null,
+    userDataDir: profileDir,
+    ignoreDefaultArgs: ["--enable-automation"],
+    args,
+  });
+
+  try {
+    const page = await browser.newPage();
+    const seenIds = new Set((bulkStateFile?.seenStatusIds || []).map((s) => safeString(s).trim()).filter(Boolean));
+
+    const collected = [];
+    for (const kw of keywords) {
+      // eslint-disable-next-line no-await-in-loop
+      const urls = await collectStatusUrlsFromSearch(page, kw, mode, limitPerKeyword);
+      for (const u of urls) {
+        const id = statusIdFromUrl(u);
+        if (id && seenIds.has(id)) continue;
+        collected.push(u);
+      }
+      // eslint-disable-next-line no-await-in-loop
+      await sleep(randomIntInclusive(600, 1200));
+    }
+
+    // 去重（保留顺序）
+    const unique = [];
+    const seenUrl = new Set();
+    for (const u of collected) {
+      const nu = normalizeXStatusUrl(u);
+      if (!nu || !isLikelyXStatusUrl(nu)) continue;
+      if (seenUrl.has(nu)) continue;
+      seenUrl.add(nu);
+      unique.push(nu);
+    }
+
+    if (unique.length === 0) {
+      // 尽量保存证据，方便用户反馈“为什么没采集到”
+      try {
+        const dir = path.join(DATA_DIR, "debug");
+        await fs.mkdir(dir, { recursive: true });
+        const stamp = Date.now();
+        const pngPath = path.join(dir, `harvest-${stamp}.png`);
+        const htmlPath = path.join(dir, `harvest-${stamp}.html`);
+        await page.screenshot({ path: pngPath }).catch(() => {});
+        const html = await page.content().catch(() => "");
+        if (html) await fs.writeFile(htmlPath, html, "utf8").catch(() => {});
+        addBulkLog(`[采集][DBG] 未采集到 URL，已保存快照 png=${safeString(pngPath)} html=${safeString(htmlPath)}`);
+      } catch {}
+      throw new Error("采集未发现任何推文链接（/status/）。可能原因：未登录/风控/关键词无结果。");
+    }
+
+    const beforeTotal = Array.isArray(bulkConfig?.followUrls) ? bulkConfig.followUrls.length : 0;
+    const addRes = await appendBulkFollowUrls(unique);
+    if (!addRes.ok) throw new Error(safeString(addRes.error));
+
+    // 写入 seenStatusIds：记录“已采集过”的推文 id（用于“每天采集新的”去重）
+    for (const u of unique) {
+      const id = statusIdFromUrl(u);
+      if (!id) continue;
+      seenIds.add(id);
+    }
+    bulkStateFile.seenStatusIds = Array.from(seenIds).slice(-20000);
+    bulkStateFile.harvest = bulkStateFile.harvest && typeof bulkStateFile.harvest === "object" ? bulkStateFile.harvest : {};
+    bulkStateFile.harvest.lastRunAt = nowIso();
+    bulkStateFile.harvest.lastError = "";
+    bulkStateFile.harvest.lastAdded = Number(addRes.added || 0);
+    markBulkStateDirty("harvest_run");
+
+    bulkSearchHarvestJob.added = Number(addRes.added || 0);
+    bulkSearchHarvestJob.totalQueue = Number(addRes.total || 0);
+
+    addBulkLog(`[采集] 完成 added=${addRes.added} queue=${beforeTotal} -> ${addRes.total}`);
+
+    if (autoStart && !bulkFollowJob?.running) {
+      addBulkLog("[采集] 已自动开始关注（队列模式）");
+      runBulkFollowCommentersQueueLoop({ maxPerAccount: startMaxPerAccount }).catch((e) => {
+        const err = safeString(e?.message || e);
+        addBulkLog(`[关注] 自动启动失败：${err}`);
+      });
+    }
+
+    return { ok: true, added: addRes.added, total: addRes.total };
+  } catch (e) {
+    const err = safeString(e?.message || e);
+    bulkSearchHarvestJob.lastError = err;
+    bulkStateFile.harvest = bulkStateFile.harvest && typeof bulkStateFile.harvest === "object" ? bulkStateFile.harvest : {};
+    bulkStateFile.harvest.lastRunAt = nowIso();
+    bulkStateFile.harvest.lastError = err;
+    markBulkStateDirty("harvest_error");
+    throw e;
+  } finally {
+    await browser.close().catch(() => {});
+    bulkSearchHarvestJob.running = false;
+    bulkSearchHarvestJob.finishedAt = nowIso();
+  }
+}
+
+function startBulkHarvestScheduler() {
+  if (bulkHarvestTimer) return;
+  bulkHarvestTimer = setInterval(() => {
+    try {
+      if (!bulkConfig?.harvestEnabled) return;
+      const keywords = parseHarvestKeywords(bulkConfig?.harvestKeywordsText || "");
+      if (keywords.length === 0) return;
+      if (bulkFollowJob?.running) return;
+      if (bulkSearchHarvestJob?.running) return;
+
+      const today = localDateKey();
+      const lastDailyKey = safeString(bulkStateFile?.harvest?.lastDailyKey).trim();
+      if (lastDailyKey === today) return;
+
+      runBulkHarvestAndMaybeStartFollow({
+        trigger: "daily",
+        keywords,
+        mode: bulkConfig?.harvestMode || "live",
+        limitPerKeyword: bulkConfig?.harvestLimitPerKeyword || 20,
+        autoStart: bulkConfig?.harvestAutoStart !== false,
+        maxPerAccount: 30,
+      })
+        .then(() => {
+          bulkStateFile.harvest = bulkStateFile.harvest && typeof bulkStateFile.harvest === "object" ? bulkStateFile.harvest : {};
+          bulkStateFile.harvest.lastDailyKey = today;
+          markBulkStateDirty("harvest_daily_key");
+        })
+        .catch((e) => {
+          const err = safeString(e?.message || e);
+          bulkStateFile.harvest = bulkStateFile.harvest && typeof bulkStateFile.harvest === "object" ? bulkStateFile.harvest : {};
+          bulkStateFile.harvest.lastRunAt = nowIso();
+          bulkStateFile.harvest.lastError = err;
+          markBulkStateDirty("harvest_daily_error");
+          addBulkLog(`[采集] 每日采集失败：${err}`);
+        });
+    } catch {}
+  }, 5 * 60_000);
 }
 
 async function appendBulkFollowUrls(urlsOrText) {
@@ -3331,6 +3731,7 @@ async function replaceBulkFollowUrls(urlsOrText) {
     const idx = Math.max(0, Math.round(Number(st.followQueueIndex) || 0));
     st.followQueueIndex = len > 0 ? idx % len : 0;
   }
+  markBulkStateDirty("queue_resize");
 
   return { ok: true, total: bulkConfig.followUrls.length, urls: bulkConfig.followUrls };
 }
@@ -3376,6 +3777,7 @@ async function removeBulkFollowUrl(urlOrIndex) {
     const idx = Math.max(0, Math.round(Number(st.followQueueIndex) || 0));
     st.followQueueIndex = len > 0 ? idx % len : 0;
   }
+  markBulkStateDirty("queue_resize");
 
   return { ok: true, removed, total: bulkConfig.followUrls.length, urls: bulkConfig.followUrls };
 }
@@ -3421,6 +3823,23 @@ function normalizeBulkConfig(raw) {
   next.followCooldownSec = Number.isFinite(followCooldownSec) ? Math.max(0, Math.min(3600, followCooldownSec)) : 0;
   const followIdleSleepSec = Math.round(Number(next.followIdleSleepSec ?? 30));
   next.followIdleSleepSec = Number.isFinite(followIdleSleepSec) ? Math.max(5, Math.min(3600, followIdleSleepSec)) : 30;
+
+  const followVisitCooldownEvery = Math.round(Number(next.followVisitCooldownEvery ?? 0));
+  next.followVisitCooldownEvery = Number.isFinite(followVisitCooldownEvery) ? Math.max(0, Math.min(1000, followVisitCooldownEvery)) : 0;
+  const followVisitCooldownSec = Math.round(Number(next.followVisitCooldownSec ?? 0));
+  next.followVisitCooldownSec = Number.isFinite(followVisitCooldownSec) ? Math.max(0, Math.min(3600, followVisitCooldownSec)) : 0;
+
+  next.followSkipCacheEnabled = next.followSkipCacheEnabled === undefined ? true : Boolean(next.followSkipCacheEnabled);
+  const followSkipCacheMax = Math.round(Number(next.followSkipCacheMax ?? 20000));
+  next.followSkipCacheMax = Number.isFinite(followSkipCacheMax) ? Math.max(0, Math.min(200000, followSkipCacheMax)) : 20000;
+
+  next.harvestKeywordsText = safeString(next.harvestKeywordsText).trim();
+  const mode = safeString(next.harvestMode || "live").trim().toLowerCase();
+  next.harvestMode = mode === "top" ? "top" : "live";
+  const harvestLimitPerKeyword = Math.round(Number(next.harvestLimitPerKeyword ?? 20));
+  next.harvestLimitPerKeyword = Number.isFinite(harvestLimitPerKeyword) ? Math.max(1, Math.min(200, harvestLimitPerKeyword)) : 20;
+  next.harvestEnabled = Boolean(next.harvestEnabled);
+  next.harvestAutoStart = next.harvestAutoStart === undefined ? true : Boolean(next.harvestAutoStart);
 
   // 代理按账号配置（account.proxy），不再使用全局默认/代理池
   delete next.defaultProxy;
@@ -3478,6 +3897,10 @@ async function ensureDataFiles() {
 
   if (!(await fileExists(BULK_CONFIG_PATH))) {
     await writeJson(BULK_CONFIG_PATH, defaultBulkConfig());
+  }
+
+  if (!(await fileExists(BULK_STATE_PATH))) {
+    await writeJson(BULK_STATE_PATH, { version: 1, updatedAt: nowIso(), states: {}, harvest: { lastDailyKey: "", lastRunAt: "", lastError: "" }, seenStatusIds: [] });
   }
 }
 
@@ -4199,6 +4622,22 @@ let bulkConfigFile = null;
 let bulkRunning = false;
 const bulkTimers = new Map(); // accountId -> Timeout
 const bulkStates = new Map(); // accountId -> state
+let bulkStateFile = { version: 1, updatedAt: "", states: {}, harvest: { lastDailyKey: "", lastRunAt: "", lastError: "", lastAdded: 0 }, seenStatusIds: [] };
+let bulkStateDirty = false;
+let bulkStateSaveTimer = null;
+
+let bulkSearchHarvestJob = {
+  running: false,
+  startedAt: "",
+  finishedAt: "",
+  keywords: [],
+  mode: "",
+  limitPerKeyword: 0,
+  added: 0,
+  totalQueue: 0,
+  lastError: "",
+};
+let bulkHarvestTimer = null;
 let bulkFollowJob = {
   running: false,
   mode: "",
@@ -4299,9 +4738,158 @@ function upsertBulkState(accountId) {
       followLastErrorAt: "",
       followSleepUntil: "",
       followSleepReason: "",
+      // 队列模式断点续跑：每个账号自己的 URL 队列指针（0-based）
+      followQueueIndex: 0,
+      // 账号一对一去重：记录“已处理过”的用户名（小写）=> 状态
+      // 注意：为避免无限增长，会按 followSkipCacheMax 做上限裁剪
+      followSeenUsers: {},
+      followSeenOrder: [],
+      followSeenUpdatedAt: "",
+      // 访问节流统计：仅统计“真正访问过主页”的次数（命中缓存跳过不计）
+      followVisitedProfiles: 0,
     });
   }
   return bulkStates.get(id);
+}
+
+function normalizeHandleKey(handle) {
+  const h = safeString(handle).trim().replace(/^@/g, "");
+  return h ? h.toLowerCase() : "";
+}
+
+function ensureBulkFollowSeenStore(state) {
+  const st = state && typeof state === "object" ? state : null;
+  if (!st) return null;
+  if (!st.followSeenUsers || typeof st.followSeenUsers !== "object") st.followSeenUsers = {};
+  if (!Array.isArray(st.followSeenOrder)) st.followSeenOrder = [];
+  if (!Number.isFinite(Number(st.followVisitedProfiles))) st.followVisitedProfiles = 0;
+  return st;
+}
+
+function pruneBulkFollowSeenStore(state, maxSize) {
+  const st = ensureBulkFollowSeenStore(state);
+  if (!st) return;
+  const max = Math.max(0, Math.round(Number(maxSize) || 0));
+  if (max <= 0) {
+    st.followSeenUsers = {};
+    st.followSeenOrder = [];
+    return;
+  }
+  const users = st.followSeenUsers && typeof st.followSeenUsers === "object" ? st.followSeenUsers : {};
+  const order = Array.isArray(st.followSeenOrder) ? st.followSeenOrder : [];
+
+  // 清理 order 中不存在的 key
+  const cleaned = [];
+  for (const k of order) {
+    const key = normalizeHandleKey(k);
+    if (!key) continue;
+    if (!users[key]) continue;
+    cleaned.push(key);
+  }
+  st.followSeenOrder = cleaned;
+
+  // 上限裁剪（移除最早的一批）
+  while (st.followSeenOrder.length > max) {
+    const oldest = st.followSeenOrder.shift();
+    if (oldest) delete users[oldest];
+  }
+  st.followSeenUsers = users;
+}
+
+function getBulkFollowSeenStatus(state, handle) {
+  const st = ensureBulkFollowSeenStore(state);
+  const key = normalizeHandleKey(handle);
+  if (!st || !key) return "";
+  const entry = st.followSeenUsers?.[key];
+  return entry && typeof entry === "object" ? safeString(entry.status).trim() : "";
+}
+
+function recordBulkFollowSeenStatus(state, handle, status) {
+  const st = ensureBulkFollowSeenStore(state);
+  const key = normalizeHandleKey(handle);
+  const s = safeString(status).trim();
+  if (!st || !key || !s) return;
+
+  if (!st.followSeenUsers[key]) {
+    st.followSeenOrder.push(key);
+  }
+  st.followSeenUsers[key] = { status: s, at: nowIso() };
+  st.followSeenUpdatedAt = nowIso();
+  pruneBulkFollowSeenStore(st, bulkConfig?.followSkipCacheMax ?? 20000);
+  markBulkStateDirty("follow_seen_update");
+}
+
+function parseHarvestKeywords(text) {
+  const raw = safeString(text).trim();
+  if (!raw) return [];
+  const items = raw
+    .split(/[\r\n,]+/g)
+    .map((s) => safeString(s).trim())
+    .filter(Boolean);
+  return uniqueStringList(items).slice(0, 50);
+}
+
+function shouldSkipProfileVisitByCache(state, handle) {
+  if (!bulkConfig?.followSkipCacheEnabled) return false;
+  const st = getBulkFollowSeenStatus(state, handle);
+  // 只跳过“确定不会再需要访问主页”的情况
+  return ["followed", "requested", "protected", "already_following", "already_requested"].includes(st);
+}
+
+function snapshotBulkStatesForSave() {
+  const states = {};
+  for (const [id, st] of bulkStates.entries()) {
+    if (!id || !st || typeof st !== "object") continue;
+    // 保存前做一次裁剪，避免文件无限变大
+    pruneBulkFollowSeenStore(st, bulkConfig?.followSkipCacheMax ?? 20000);
+    states[id] = st;
+  }
+  return states;
+}
+
+function markBulkStateDirty(reason) {
+  bulkStateDirty = true;
+  if (bulkStateSaveTimer) return;
+  const tag = safeString(reason).trim() || "unknown";
+  bulkStateSaveTimer = setTimeout(() => {
+    bulkStateSaveTimer = null;
+    flushBulkStateFile(`debounced:${tag}`).catch(() => {});
+  }, 1200);
+}
+
+async function flushBulkStateFile(reason) {
+  if (!bulkStateDirty) return;
+  bulkStateDirty = false;
+
+  const next = bulkStateFile && typeof bulkStateFile === "object" ? bulkStateFile : { version: 1 };
+  next.version = 1;
+  next.updatedAt = nowIso();
+  next.states = snapshotBulkStatesForSave();
+  if (!next.harvest || typeof next.harvest !== "object") next.harvest = { lastDailyKey: "", lastRunAt: "", lastError: "", lastAdded: 0 };
+  if (!Array.isArray(next.seenStatusIds)) next.seenStatusIds = [];
+  // 上限裁剪：避免“每天采集”长期累积过大
+  if (next.seenStatusIds.length > 20000) next.seenStatusIds = next.seenStatusIds.slice(-20000);
+
+  bulkStateFile = next;
+  await writeJson(BULK_STATE_PATH, bulkStateFile);
+  addBulkLog(`[状态] 已保存 bulk_state.json reason=${safeString(reason)} accounts=${Object.keys(next.states || {}).length}`);
+}
+
+async function loadBulkStateFile() {
+  const raw = await readJson(BULK_STATE_PATH, null);
+  const file = raw && typeof raw === "object" ? raw : null;
+  if (!file) return;
+
+  bulkStateFile = file;
+  const states = file.states && typeof file.states === "object" ? file.states : {};
+  for (const [id, st] of Object.entries(states)) {
+    if (!id || !st || typeof st !== "object") continue;
+    const local = upsertBulkState(id);
+    if (!local) continue;
+    Object.assign(local, st);
+    ensureBulkFollowSeenStore(local);
+    pruneBulkFollowSeenStore(local, bulkConfig?.followSkipCacheMax ?? 20000);
+  }
 }
 
 function randomIntInclusive(min, max) {
@@ -5334,6 +5922,16 @@ async function main() {
   }
   bulkConfig = normalizeBulkConfig(bulkConfigFile);
   bulkFollowUrlsUpdatedAt = nowIso();
+  await loadBulkStateFile();
+  // 载入后确保结构健全，避免旧文件缺字段导致 500
+  if (!bulkStateFile || typeof bulkStateFile !== "object") {
+    bulkStateFile = { version: 1, updatedAt: nowIso(), states: {}, harvest: { lastDailyKey: "", lastRunAt: "", lastError: "", lastAdded: 0 }, seenStatusIds: [] };
+  }
+  if (!bulkStateFile.harvest || typeof bulkStateFile.harvest !== "object") {
+    bulkStateFile.harvest = { lastDailyKey: "", lastRunAt: "", lastError: "", lastAdded: 0 };
+  }
+  if (!Array.isArray(bulkStateFile.seenStatusIds)) bulkStateFile.seenStatusIds = [];
+  startBulkHarvestScheduler();
 
   const app = express();
   app.use(cors());
@@ -6005,6 +6603,43 @@ async function main() {
     } catch (e) {
       const err = safeString(e?.message || e);
       addBulkLog(`[关注] 清空 URL 失败：${err}`);
+      return res.status(500).json({ error: err });
+    }
+  });
+
+  // 关键词采集：从 X 搜索页采集 /status/ URL，追加到队列，并可自动开始关注
+  app.get("/api/bulk/search-harvest/status", async (_req, res) => {
+    res.json({
+      ok: true,
+      job: bulkSearchHarvestJob,
+      harvest: bulkStateFile?.harvest || { lastDailyKey: "", lastRunAt: "", lastError: "", lastAdded: 0 },
+    });
+  });
+
+  app.post("/api/bulk/search-harvest/run", async (req, res) => {
+    try {
+      const keywordsText = safeString(req.body?.keywordsText ?? req.body?.keywords ?? "").trim();
+      const keywords = parseHarvestKeywords(keywordsText);
+      const mode = safeString(req.body?.mode ?? "live").trim().toLowerCase() === "top" ? "top" : "live";
+      const limitPerKeyword = Math.max(1, Math.min(200, Math.round(Number(req.body?.limitPerKeyword) || 20)));
+      const autoStart = req.body?.autoStart === undefined ? true : Boolean(req.body?.autoStart);
+      const maxPerAccount = Math.max(1, Math.min(BULK_FOLLOW_COMMENTERS_DAILY_LIMIT, Math.round(Number(req.body?.maxPerAccount) || 30)));
+
+      if (bulkSearchHarvestJob?.running) return res.status(409).json({ error: "采集任务正在运行中" });
+      if (bulkFollowJob?.running) return res.status(409).json({ error: "关注任务运行中：请先停止关注任务再采集（避免浏览器 Profile 冲突）" });
+      if (keywords.length === 0) return res.status(400).json({ error: "请先填写关键词（可多行）" });
+
+      runBulkHarvestAndMaybeStartFollow({ trigger: "manual", keywords, mode, limitPerKeyword, autoStart, maxPerAccount }).catch((e) => {
+        const err = safeString(e?.message || e);
+        addBulkLog(`[采集] 全局任务异常：${err}`);
+        bulkSearchHarvestJob.running = false;
+        bulkSearchHarvestJob.finishedAt = nowIso();
+      });
+
+      return res.json({ ok: true, job: bulkSearchHarvestJob });
+    } catch (e) {
+      const err = safeString(e?.message || e);
+      addBulkLog(`[采集] 启动失败：${err}`);
       return res.status(500).json({ error: err });
     }
   });
