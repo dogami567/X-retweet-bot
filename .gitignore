@@ -25,3 +25,4 @@ yarn-error.log*
 test-results/
 playwright-report/
 data/debug/
+x-批量使用.docx

@@ -22,6 +22,19 @@ Copy-Item -Force (Join-Path $repoRoot "README.md") (Join-Path $outDir "README.md
 Copy-Item -Force (Join-Path $repoRoot ".env.empty") (Join-Path $outDir ".env")
 Copy-Item -Force (Join-Path $repoRoot ".env.example") (Join-Path $outDir ".env.example")
 
+# 可选：把小白图文教程也打进 ZIP，方便分发（文件不存在则跳过）
+$tutorialDocx = Join-Path $repoRoot "docs\\X-Bulk-批量使用-小白图文教程.docx"
+if (Test-Path $tutorialDocx) {
+  $docsOut = Join-Path $outDir "docs"
+  New-Item -ItemType Directory -Path $docsOut -Force | Out-Null
+  Copy-Item -Force $tutorialDocx (Join-Path $docsOut "X-Bulk-批量使用-小白图文教程.docx")
+
+  $assetsDir = Join-Path $repoRoot "docs\\tutorial-assets"
+  if (Test-Path $assetsDir) {
+    Copy-Item -Recurse -Force $assetsDir (Join-Path $docsOut "tutorial-assets")
+  }
+}
+
 # 预创建可写目录，避免小白第一次运行误以为没生成文件
 New-Item -ItemType Directory -Path (Join-Path $outDir "data") | Out-Null
 
