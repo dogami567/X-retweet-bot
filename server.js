@@ -3785,74 +3785,76 @@ async function removeBulkFollowUrl(urlOrIndex) {
 function normalizeBulkConfig(raw) {
   const next = raw && typeof raw === "object" ? JSON.parse(JSON.stringify(raw)) : defaultBulkConfig();
   if (!next || typeof next !== "object") return defaultBulkConfig();
+  const migrated = migrateBulkConfigLegacyTweetUrl(next);
+  const normalizedInput = migrated && migrated.config && typeof migrated.config === "object" ? migrated.config : next;
 
-  next.version = 1;
-  next.imageDir = safeString(next.imageDir).trim();
-  if (!next.imageDir) next.imageDir = "data/bulk-images";
+  normalizedInput.version = 1;
+  normalizedInput.imageDir = safeString(normalizedInput.imageDir).trim();
+  if (!normalizedInput.imageDir) normalizedInput.imageDir = "data/bulk-images";
 
-  const scan = Number(next.scanIntervalSec ?? 3600);
-  next.scanIntervalSec = Number.isFinite(scan) ? Math.max(300, Math.round(scan)) : 3600;
+  const scan = Number(normalizedInput.scanIntervalSec ?? 3600);
+  normalizedInput.scanIntervalSec = Number.isFinite(scan) ? Math.max(300, Math.round(scan)) : 3600;
 
-  const followWaitSec = Math.round(Number(next.followWaitSec ?? 18));
-  next.followWaitSec = Number.isFinite(followWaitSec) ? Math.max(3, Math.min(600, followWaitSec)) : 18;
-  const followConcurrency = Math.round(Number(next.followConcurrency ?? 1));
-  next.followConcurrency = Number.isFinite(followConcurrency) ? Math.max(1, Math.min(6, followConcurrency)) : 1;
-  const followJitterSec = Math.round(Number(next.followJitterSec ?? 4));
-  next.followJitterSec = Number.isFinite(followJitterSec) ? Math.max(0, Math.min(120, followJitterSec)) : 4;
+  const followWaitSec = Math.round(Number(normalizedInput.followWaitSec ?? 18));
+  normalizedInput.followWaitSec = Number.isFinite(followWaitSec) ? Math.max(3, Math.min(600, followWaitSec)) : 18;
+  const followConcurrency = Math.round(Number(normalizedInput.followConcurrency ?? 1));
+  normalizedInput.followConcurrency = Number.isFinite(followConcurrency) ? Math.max(1, Math.min(6, followConcurrency)) : 1;
+  const followJitterSec = Math.round(Number(normalizedInput.followJitterSec ?? 4));
+  normalizedInput.followJitterSec = Number.isFinite(followJitterSec) ? Math.max(0, Math.min(120, followJitterSec)) : 4;
 
-  if (typeof next.followUrls === "string") next.followUrls = next.followUrls.split(/[\r\n,]+/g);
-  if (!Array.isArray(next.followUrls)) next.followUrls = [];
-  next.followUrls = next.followUrls
+  if (typeof normalizedInput.followUrls === "string") normalizedInput.followUrls = normalizedInput.followUrls.split(/[\r\n,]+/g);
+  if (!Array.isArray(normalizedInput.followUrls)) normalizedInput.followUrls = [];
+  normalizedInput.followUrls = normalizedInput.followUrls
     .map((u) => normalizeXStatusUrl(safeString(u).trim()))
     .filter((u) => isLikelyXStatusUrl(u));
   const followUrlsDedup = [];
   const followUrlsSeen = new Set();
-  for (const u of next.followUrls) {
+  for (const u of normalizedInput.followUrls) {
     if (followUrlsSeen.has(u)) continue;
     followUrlsSeen.add(u);
     followUrlsDedup.push(u);
     if (followUrlsDedup.length >= 2000) break;
   }
-  next.followUrls = followUrlsDedup;
+  normalizedInput.followUrls = followUrlsDedup;
 
-  const followActionDelaySec = Math.round(Number(next.followActionDelaySec ?? 0));
-  next.followActionDelaySec = Number.isFinite(followActionDelaySec) ? Math.max(0, Math.min(600, followActionDelaySec)) : 0;
-  const followCooldownEvery = Math.round(Number(next.followCooldownEvery ?? 0));
-  next.followCooldownEvery = Number.isFinite(followCooldownEvery) ? Math.max(0, Math.min(200, followCooldownEvery)) : 0;
-  const followCooldownSec = Math.round(Number(next.followCooldownSec ?? 0));
-  next.followCooldownSec = Number.isFinite(followCooldownSec) ? Math.max(0, Math.min(3600, followCooldownSec)) : 0;
-  const followIdleSleepSec = Math.round(Number(next.followIdleSleepSec ?? 30));
-  next.followIdleSleepSec = Number.isFinite(followIdleSleepSec) ? Math.max(5, Math.min(3600, followIdleSleepSec)) : 30;
+  const followActionDelaySec = Math.round(Number(normalizedInput.followActionDelaySec ?? 0));
+  normalizedInput.followActionDelaySec = Number.isFinite(followActionDelaySec) ? Math.max(0, Math.min(600, followActionDelaySec)) : 0;
+  const followCooldownEvery = Math.round(Number(normalizedInput.followCooldownEvery ?? 0));
+  normalizedInput.followCooldownEvery = Number.isFinite(followCooldownEvery) ? Math.max(0, Math.min(200, followCooldownEvery)) : 0;
+  const followCooldownSec = Math.round(Number(normalizedInput.followCooldownSec ?? 0));
+  normalizedInput.followCooldownSec = Number.isFinite(followCooldownSec) ? Math.max(0, Math.min(3600, followCooldownSec)) : 0;
+  const followIdleSleepSec = Math.round(Number(normalizedInput.followIdleSleepSec ?? 30));
+  normalizedInput.followIdleSleepSec = Number.isFinite(followIdleSleepSec) ? Math.max(5, Math.min(3600, followIdleSleepSec)) : 30;
 
-  const followVisitCooldownEvery = Math.round(Number(next.followVisitCooldownEvery ?? 0));
-  next.followVisitCooldownEvery = Number.isFinite(followVisitCooldownEvery) ? Math.max(0, Math.min(1000, followVisitCooldownEvery)) : 0;
-  const followVisitCooldownSec = Math.round(Number(next.followVisitCooldownSec ?? 0));
-  next.followVisitCooldownSec = Number.isFinite(followVisitCooldownSec) ? Math.max(0, Math.min(3600, followVisitCooldownSec)) : 0;
+  const followVisitCooldownEvery = Math.round(Number(normalizedInput.followVisitCooldownEvery ?? 0));
+  normalizedInput.followVisitCooldownEvery = Number.isFinite(followVisitCooldownEvery) ? Math.max(0, Math.min(1000, followVisitCooldownEvery)) : 0;
+  const followVisitCooldownSec = Math.round(Number(normalizedInput.followVisitCooldownSec ?? 0));
+  normalizedInput.followVisitCooldownSec = Number.isFinite(followVisitCooldownSec) ? Math.max(0, Math.min(3600, followVisitCooldownSec)) : 0;
 
-  next.followSkipCacheEnabled = next.followSkipCacheEnabled === undefined ? true : Boolean(next.followSkipCacheEnabled);
-  const followSkipCacheMax = Math.round(Number(next.followSkipCacheMax ?? 20000));
-  next.followSkipCacheMax = Number.isFinite(followSkipCacheMax) ? Math.max(0, Math.min(200000, followSkipCacheMax)) : 20000;
+  normalizedInput.followSkipCacheEnabled = normalizedInput.followSkipCacheEnabled === undefined ? true : Boolean(normalizedInput.followSkipCacheEnabled);
+  const followSkipCacheMax = Math.round(Number(normalizedInput.followSkipCacheMax ?? 20000));
+  normalizedInput.followSkipCacheMax = Number.isFinite(followSkipCacheMax) ? Math.max(0, Math.min(200000, followSkipCacheMax)) : 20000;
 
-  next.harvestKeywordsText = safeString(next.harvestKeywordsText).trim();
-  const mode = safeString(next.harvestMode || "live").trim().toLowerCase();
-  next.harvestMode = mode === "top" ? "top" : "live";
-  const harvestLimitPerKeyword = Math.round(Number(next.harvestLimitPerKeyword ?? 20));
-  next.harvestLimitPerKeyword = Number.isFinite(harvestLimitPerKeyword) ? Math.max(1, Math.min(200, harvestLimitPerKeyword)) : 20;
-  next.harvestEnabled = Boolean(next.harvestEnabled);
-  next.harvestAutoStart = next.harvestAutoStart === undefined ? true : Boolean(next.harvestAutoStart);
+  normalizedInput.harvestKeywordsText = safeString(normalizedInput.harvestKeywordsText).trim();
+  const mode = safeString(normalizedInput.harvestMode || "live").trim().toLowerCase();
+  normalizedInput.harvestMode = mode === "top" ? "top" : "live";
+  const harvestLimitPerKeyword = Math.round(Number(normalizedInput.harvestLimitPerKeyword ?? 20));
+  normalizedInput.harvestLimitPerKeyword = Number.isFinite(harvestLimitPerKeyword) ? Math.max(1, Math.min(200, harvestLimitPerKeyword)) : 20;
+  normalizedInput.harvestEnabled = Boolean(normalizedInput.harvestEnabled);
+  normalizedInput.harvestAutoStart = normalizedInput.harvestAutoStart === undefined ? true : Boolean(normalizedInput.harvestAutoStart);
 
   // 代理按账号配置（account.proxy），不再使用全局默认/代理池
-  delete next.defaultProxy;
-  delete next.proxyPool;
+  delete normalizedInput.defaultProxy;
+  delete normalizedInput.proxyPool;
 
-  if (typeof next.captions === "string") next.captions = next.captions.split(/\r?\n/g);
-  if (!Array.isArray(next.captions)) next.captions = [];
-  next.captions = next.captions.map((s) => safeString(s).trim()).filter(Boolean);
+  if (typeof normalizedInput.captions === "string") normalizedInput.captions = normalizedInput.captions.split(/\r?\n/g);
+  if (!Array.isArray(normalizedInput.captions)) normalizedInput.captions = [];
+  normalizedInput.captions = normalizedInput.captions.map((s) => safeString(s).trim()).filter(Boolean);
 
-  if (!Array.isArray(next.accounts)) next.accounts = [];
-  next.accounts = next.accounts.map((a) => normalizeBulkAccount(a)).filter(Boolean);
+  if (!Array.isArray(normalizedInput.accounts)) normalizedInput.accounts = [];
+  normalizedInput.accounts = normalizedInput.accounts.map((a) => normalizeBulkAccount(a)).filter(Boolean);
 
-  return next;
+  return normalizedInput;
 }
 
 function resolveBulkImageDir(cfg) {
