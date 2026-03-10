@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- 批量关注：支持 `queue_cycle` 采集补链、最小补采间隔、队列状态提示（当前 URL / 队列指针 / waitState / lastEndedBecause）。
+- 批量关注：新增“仅关注已认证账号 / 仅关注 bio 含中文账号”过滤规则，并在 Bulk 面板补齐保存/回填。
+- 批量发帖：保存内容池配置时不再全局 stop/start；运行中新增文案、稳定图片可被后续任务拾取，半成品图片会被自动排除。
+- 测试：新增 `tests/bulk.hot-update.e2e.spec.js`，并提供 `npm run test:bulk-regression`、`npm run test:e2e:bulk-core`、`npm run test:e2e:harvest-acceptance` 回归入口。
 - 图库：新增“稳定窗口”避免拷贝/写入未完成的图片被扫描/选中；若图片不可读会自动跳过，不再导致整次发帖失败。
 
 ## v0.3.23 (2026-02-04)
