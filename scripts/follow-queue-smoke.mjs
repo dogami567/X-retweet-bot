@@ -98,9 +98,32 @@ async function main() {
 
     const cfg0 = await httpJson(`${base}/api/bulk/config`);
     assert(cfg0.ok && cfg0.json?.config, "读取 bulk config 失败");
+    let workingConfig = { ...cfg0.json.config };
+
+    const hasFollowAccount = Array.isArray(workingConfig.accounts)
+      && workingConfig.accounts.some((a) => Boolean(a?.followCommentersEnabled) && String(a?.id || "").trim());
+    if (!hasFollowAccount) {
+      const nextAccounts = Array.isArray(workingConfig.accounts) ? workingConfig.accounts.slice() : [];
+      nextAccounts.push({
+        id: "acc_follow_queue_smoke",
+        name: "acc_follow_queue_smoke",
+        enabled: true,
+        dryRun: true,
+        followCommentersEnabled: true,
+        proxy: "",
+        schedule: { intervalMin: 120, jitterMin: 0, imagesMin: 1, imagesMax: 1 },
+        x: { apiKey: "", apiSecret: "", accessToken: "", accessSecret: "", profileDir: "" },
+      });
+      const ensureAccounts = await httpJson(`${base}/api/bulk/config`, {
+        method: "POST",
+        body: JSON.stringify({ ...workingConfig, accounts: nextAccounts }),
+      });
+      assert(ensureAccounts.ok && ensureAccounts.json?.config, "注入 follow-queue smoke 临时账号失败");
+      workingConfig = { ...ensureAccounts.json.config };
+    }
 
     const cfgQueueCycle = {
-      ...cfg0.json.config,
+      ...workingConfig,
       harvestRepeatStrategy: "queue_cycle",
       harvestMinIntervalSec: 900,
     };
@@ -119,7 +142,7 @@ async function main() {
     assert(harvest0.json.harvest.lastQueueCycleAt !== undefined, "harvest status.harvest.lastQueueCycleAt 缺失");
 
     // 保证本脚本不会意外触发浏览器：强制 followUrls 为空
-    const cfgNoUrls = { ...cfg0.json.config, followUrls: [] };
+    const cfgNoUrls = { ...cfgQueueCycle, followUrls: [] };
     const save0 = await httpJson(`${base}/api/bulk/config`, { method: "POST", body: JSON.stringify(cfgNoUrls) });
     assert(save0.ok, "保存 followUrls=[] 失败");
 
