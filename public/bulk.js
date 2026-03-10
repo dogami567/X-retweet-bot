@@ -35,6 +35,13 @@ function safeJson(obj) {
   return JSON.stringify(obj ?? {}, null, 2);
 }
 
+function formatDateTime(value) {
+  const text = String(value || "").trim();
+  if (!text) return "";
+  const date = new Date(text);
+  return Number.isNaN(date.getTime()) ? text : date.toLocaleString();
+}
+
 function setJsonBox(obj) {
   byId("apiResponse").textContent = safeJson(obj);
 }
@@ -69,6 +76,17 @@ let config = {
   followActionDelaySec: 0,
   followCooldownEvery: 0,
   followCooldownSec: 0,
+  followVisitCooldownEvery: 0,
+  followVisitCooldownSec: 0,
+  followRequireVerified: false,
+  followRequireChineseBio: false,
+  harvestKeywordsText: "",
+  harvestMode: "live",
+  harvestLimitPerKeyword: 20,
+  harvestEnabled: false,
+  harvestAutoStart: true,
+  harvestRepeatStrategy: "daily",
+  harvestMinIntervalSec: 900,
   captions: [],
   accounts: [],
 };
@@ -225,12 +243,16 @@ function applyBaseFormToConfig() {
   config.followCooldownSec = Number(byId("followCooldownSec")?.value || 0);
   config.followVisitCooldownEvery = Number(byId("followVisitCooldownEvery")?.value || 0);
   config.followVisitCooldownSec = Number(byId("followVisitCooldownSec")?.value || 0);
+  config.followRequireVerified = Boolean(byId("followRequireVerified")?.checked);
+  config.followRequireChineseBio = Boolean(byId("followRequireChineseBio")?.checked);
 
   config.harvestKeywordsText = String(byId("harvestKeywordsText")?.value || "").trim();
   config.harvestMode = String(byId("harvestMode")?.value || "live").trim();
   config.harvestLimitPerKeyword = Number(byId("harvestLimitPerKeyword")?.value || 20);
   config.harvestEnabled = Boolean(byId("harvestEnabled")?.checked);
   config.harvestAutoStart = Boolean(byId("harvestAutoStart")?.checked);
+  config.harvestRepeatStrategy = String(byId("harvestRepeatStrategy")?.value || "daily").trim() || "daily";
+  config.harvestMinIntervalSec = Number(byId("harvestMinIntervalSec")?.value || 900);
 }
 
 function renderBaseForm() {
@@ -252,6 +274,10 @@ function renderBaseForm() {
   if (visitEveryEl) visitEveryEl.value = String(config.followVisitCooldownEvery ?? 0);
   const visitSecEl = byId("followVisitCooldownSec");
   if (visitSecEl) visitSecEl.value = String(config.followVisitCooldownSec ?? 0);
+  const requireVerifiedEl = byId("followRequireVerified");
+  if (requireVerifiedEl) requireVerifiedEl.checked = Boolean(config.followRequireVerified);
+  const requireChineseBioEl = byId("followRequireChineseBio");
+  if (requireChineseBioEl) requireChineseBioEl.checked = Boolean(config.followRequireChineseBio);
 
   const harvestTextEl = byId("harvestKeywordsText");
   if (harvestTextEl) harvestTextEl.value = String(config.harvestKeywordsText || "");
@@ -263,6 +289,10 @@ function renderBaseForm() {
   if (harvestEnabledEl) harvestEnabledEl.checked = Boolean(config.harvestEnabled);
   const harvestAutoStartEl = byId("harvestAutoStart");
   if (harvestAutoStartEl) harvestAutoStartEl.checked = config.harvestAutoStart !== false;
+  const harvestRepeatStrategyEl = byId("harvestRepeatStrategy");
+  if (harvestRepeatStrategyEl) harvestRepeatStrategyEl.value = String(config.harvestRepeatStrategy || "daily");
+  const harvestMinIntervalEl = byId("harvestMinIntervalSec");
+  if (harvestMinIntervalEl) harvestMinIntervalEl.value = String(config.harvestMinIntervalSec ?? 900);
 }
 
 function renderCaptionList() {
@@ -391,9 +421,13 @@ async function loadConfig() {
   if (!Number.isFinite(Number(config.followCooldownSec))) config.followCooldownSec = 0;
   if (!Number.isFinite(Number(config.followVisitCooldownEvery))) config.followVisitCooldownEvery = 0;
   if (!Number.isFinite(Number(config.followVisitCooldownSec))) config.followVisitCooldownSec = 0;
+  config.followRequireVerified = config.followRequireVerified === true;
+  config.followRequireChineseBio = config.followRequireChineseBio === true;
   if (!Number.isFinite(Number(config.harvestLimitPerKeyword))) config.harvestLimitPerKeyword = 20;
   if (!config.harvestMode) config.harvestMode = "live";
   if (config.harvestAutoStart === undefined) config.harvestAutoStart = true;
+  if (!["daily", "queue_cycle"].includes(String(config.harvestRepeatStrategy || "").trim())) config.harvestRepeatStrategy = "daily";
+  if (!Number.isFinite(Number(config.harvestMinIntervalSec))) config.harvestMinIntervalSec = 900;
 
   renderBaseForm();
   renderCaptionList();
@@ -417,9 +451,13 @@ async function saveConfig() {
   if (!Number.isFinite(Number(config.followCooldownSec))) config.followCooldownSec = 0;
   if (!Number.isFinite(Number(config.followVisitCooldownEvery))) config.followVisitCooldownEvery = 0;
   if (!Number.isFinite(Number(config.followVisitCooldownSec))) config.followVisitCooldownSec = 0;
+  config.followRequireVerified = config.followRequireVerified === true;
+  config.followRequireChineseBio = config.followRequireChineseBio === true;
   if (!Number.isFinite(Number(config.harvestLimitPerKeyword))) config.harvestLimitPerKeyword = 20;
   if (!config.harvestMode) config.harvestMode = "live";
   if (config.harvestAutoStart === undefined) config.harvestAutoStart = true;
+  if (!["daily", "queue_cycle"].includes(String(config.harvestRepeatStrategy || "").trim())) config.harvestRepeatStrategy = "daily";
+  if (!Number.isFinite(Number(config.harvestMinIntervalSec))) config.harvestMinIntervalSec = 900;
   renderBaseForm();
   renderCaptionList();
   renderAccountsList();
@@ -503,11 +541,26 @@ function setFollowQueueHint(queue) {
   const total = Number(q.urlsTotal ?? 0);
   const currentUrl = String(q.currentUrl || "").trim();
   const updatedAt = String(q.updatedAt || "").trim();
-  const updatedAtText = updatedAt ? new Date(updatedAt).toLocaleString() : "";
+  const updatedAtText = formatDateTime(updatedAt);
+  const currentUrlNumber = Number.isFinite(Number(q.currentUrlNumber))
+    ? Math.max(0, Math.round(Number(q.currentUrlNumber) || 0))
+    : Math.max(0, Math.round(Number(q.currentUrlIndex) || 0) + 1);
+  const followQueueNumber = Number.isFinite(Number(q.followQueueNumber))
+    ? Math.max(0, Math.round(Number(q.followQueueNumber) || 0))
+    : Math.max(0, Math.round(Number(q.followQueueIndex) || 0) + 1);
+  const waitState = String(q.waitState || q.sleepReason || "").trim();
+  const lastEndedBecause = String(q.lastEndedBecause || "").trim();
+  const sleepRemainingSec = Number(q.sleepRemainingSec ?? 0);
 
-  const currentText = currentUrl ? ` | 当前：${currentUrl}` : "";
+  const currentText = currentUrl
+    ? ` | 当前 URL：${currentUrlNumber > 0 ? `${currentUrlNumber}/${Math.max(total, currentUrlNumber)} ` : ""}${currentUrl}`
+    : "";
+  const pointerText = total > 0 ? ` | 队列指针：${followQueueNumber}/${total}` : "";
+  const waitText = waitState ? ` | 等待：${waitState}` : "";
+  const remainingText = sleepRemainingSec > 0 ? ` | 剩余：${sleepRemainingSec}s` : "";
+  const endedText = lastEndedBecause ? ` | 最近结束：${lastEndedBecause}` : "";
   const updatedText = updatedAtText ? ` | 更新：${updatedAtText}` : "";
-  el.textContent = `队列：${total}${currentText}${updatedText}`;
+  el.textContent = `队列：${total}${currentText}${pointerText}${waitText}${remainingText}${endedText}${updatedText}`;
 }
 
 function setHarvestHint(payload) {
@@ -522,18 +575,28 @@ function setHarvestHint(payload) {
   const mode = String(job.mode || "").trim();
   const keywords = Array.isArray(job.keywords) ? job.keywords.length : 0;
   const added = Number(job.added ?? harvest.lastAdded ?? 0);
-  const lastRunAt = harvest.lastRunAt ? new Date(harvest.lastRunAt).toLocaleString() : "";
+  const lastRunAt = formatDateTime(harvest.lastRunAt);
   const lastErr = String(harvest.lastError || job.lastError || "").trim();
   const dailyKey = String(harvest.lastDailyKey || "").trim();
+  const lastTrigger = String(harvest.lastTrigger || "").trim();
+  const lastRequestedAt = formatDateTime(harvest.lastRequestedAt);
+  const lastQueueCycleAt = formatDateTime(harvest.lastQueueCycleAt);
+  const repeatStrategy = String(config.harvestRepeatStrategy || "").trim();
+  const minIntervalSec = Number(config.harvestMinIntervalSec ?? 0);
 
   const modeText = mode === "top" ? "热门" : mode === "live" ? "最新" : mode ? mode : "-";
-  const runText = lastRunAt ? `上次：${lastRunAt}` : "上次：-";
+  const strategyText = repeatStrategy ? ` | 策略：${repeatStrategy}` : "";
+  const intervalText = minIntervalSec > 0 ? ` | 最小间隔：${minIntervalSec}s` : "";
+  const runText = lastRunAt ? `上次完成：${lastRunAt}` : "上次完成：-";
+  const triggerText = lastTrigger ? ` | 触发：${lastTrigger}` : "";
+  const requestedText = lastRequestedAt ? ` | 最近请求：${lastRequestedAt}` : "";
+  const queueCycleText = lastQueueCycleAt ? ` | 最近补采：${lastQueueCycleAt}` : "";
   const dailyText = dailyKey ? ` | 每日：${dailyKey}` : "";
   const addedText = Number.isFinite(added) ? ` | 新增：${added}` : "";
   const kwText = keywords > 0 ? ` | 关键词：${keywords}` : "";
   const errText = lastErr ? ` | 错误：${lastErr}` : "";
 
-  el.textContent = `${running ? "采集中…" : "采集状态"} | 模式：${modeText}${kwText} | ${runText}${dailyText}${addedText}${errText}`;
+  el.textContent = `${running ? "采集中…" : "采集状态"} | 模式：${modeText}${kwText}${strategyText}${intervalText} | ${runText}${triggerText}${requestedText}${queueCycleText}${dailyText}${addedText}${errText}`;
 }
 
 async function harvestStatus(options = {}) {

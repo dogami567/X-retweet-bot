@@ -37,6 +37,8 @@ test.describe("X-Bulk 面板", () => {
     await expect(page.locator("#harvestKeywordsText")).toBeVisible();
     await expect(page.locator("#harvestMode")).toBeVisible();
     await expect(page.locator("#harvestLimitPerKeyword")).toBeVisible();
+    await expect(page.locator("#harvestRepeatStrategy")).toBeVisible();
+    await expect(page.locator("#harvestMinIntervalSec")).toBeVisible();
     await expect(page.locator("#btnHarvestOnce")).toBeVisible();
     await expect(page.locator("#btnHarvestAndStart")).toBeVisible();
     await expect(page.locator("#btnHarvestStatus")).toBeVisible();
@@ -44,6 +46,8 @@ test.describe("X-Bulk 面板", () => {
     // 访问节流
     await expect(page.locator("#followVisitCooldownEvery")).toBeVisible();
     await expect(page.locator("#followVisitCooldownSec")).toBeVisible();
+    await expect(page.locator("#followRequireVerified")).toBeVisible();
+    await expect(page.locator("#followRequireChineseBio")).toBeVisible();
   });
 
   test("队列：覆盖队列后列表出现链接", async ({ page }) => {
@@ -66,6 +70,27 @@ test.describe("X-Bulk 面板", () => {
 
     // apiResponse 输出框应包含错误信息
     await expect(page.locator("#apiResponse")).toContainText("error", { ignoreCase: true });
+  });
+
+  test("新增过滤与补采配置：保存后刷新仍正确回填", async ({ page }) => {
+    test.skip(!originalBulkConfig, "缺少原始 bulk config");
+
+    await page.goto("/bulk.html", { waitUntil: "domcontentloaded" });
+
+    await page.locator("#followRequireVerified").check();
+    await page.locator("#followRequireChineseBio").check();
+    await page.locator("#harvestRepeatStrategy").selectOption("queue_cycle");
+    await page.locator("#harvestMinIntervalSec").fill("1234");
+
+    const saveResponse = page.waitForResponse((res) => res.url().endsWith("/api/bulk/config") && res.request().method() === "POST");
+    await page.locator("#btnSaveConfig").click();
+    expect((await saveResponse).ok()).toBeTruthy();
+
+    await page.reload({ waitUntil: "domcontentloaded" });
+    await expect(page.locator("#followRequireVerified")).toBeChecked();
+    await expect(page.locator("#followRequireChineseBio")).toBeChecked();
+    await expect(page.locator("#harvestRepeatStrategy")).toHaveValue("queue_cycle");
+    await expect(page.locator("#harvestMinIntervalSec")).toHaveValue("1234");
   });
 
   test("关注启动：无可执行账号时返回提示", async ({ request }) => {
