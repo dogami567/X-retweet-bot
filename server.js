@@ -591,9 +591,76 @@ function defaultBulkConfig() {
     harvestLimitPerKeyword: 20,
     harvestEnabled: false, // 每天自动采集
     harvestAutoStart: true, // 采集后自动开始关注（队列模式）
+    harvestRepeatStrategy: "daily",
+    harvestMinIntervalSec: 1800,
     captions: [],
     accounts: [],
   };
+}
+
+const BULK_HARVEST_REPEAT_STRATEGIES = new Set(["daily", "queue_cycle"]);
+const DEFAULT_BULK_HARVEST_REPEAT_STRATEGY = "daily";
+const DEFAULT_BULK_HARVEST_MIN_INTERVAL_SEC = 1800;
+
+function defaultBulkHarvestState() {
+  return {
+    lastDailyKey: "",
+    lastRunAt: "",
+    lastError: "",
+    lastAdded: 0,
+    lastTrigger: "",
+    lastRequestedAt: "",
+    lastQueueCycleAt: "",
+  };
+}
+
+function normalizeBulkHarvestState(raw) {
+  const base = defaultBulkHarvestState();
+  const next = raw && typeof raw === "object" ? { ...raw } : {};
+  const normalized = { ...base, ...next };
+
+  normalized.lastDailyKey = safeString(normalized.lastDailyKey).trim();
+  normalized.lastRunAt = safeString(normalized.lastRunAt).trim();
+  normalized.lastError = safeString(normalized.lastError).trim();
+  normalized.lastAdded = Math.max(0, Math.round(Number(normalized.lastAdded) || 0));
+
+  const trigger = safeString(normalized.lastTrigger).trim().toLowerCase();
+  normalized.lastTrigger = trigger || "";
+  normalized.lastRequestedAt = safeString(normalized.lastRequestedAt).trim();
+  normalized.lastQueueCycleAt = safeString(normalized.lastQueueCycleAt).trim();
+
+  return normalized;
+}
+
+function getBulkHarvestRepeatStrategy(cfg = bulkConfig) {
+  const raw = safeString(cfg?.harvestRepeatStrategy || DEFAULT_BULK_HARVEST_REPEAT_STRATEGY)
+    .trim()
+    .toLowerCase();
+  return BULK_HARVEST_REPEAT_STRATEGIES.has(raw) ? raw : DEFAULT_BULK_HARVEST_REPEAT_STRATEGY;
+}
+
+function getBulkHarvestMinIntervalSec(cfg = bulkConfig) {
+  const raw = Math.round(Number(cfg?.harvestMinIntervalSec ?? DEFAULT_BULK_HARVEST_MIN_INTERVAL_SEC));
+  return Number.isFinite(raw) ? Math.max(60, Math.min(86400, raw)) : DEFAULT_BULK_HARVEST_MIN_INTERVAL_SEC;
+}
+
+function getBulkHarvestReferenceTimeMs(harvestState) {
+  const st = normalizeBulkHarvestState(harvestState);
+  const requestedMs = Date.parse(st.lastRequestedAt);
+  const runMs = Date.parse(st.lastRunAt);
+  const queueCycleMs = Date.parse(st.lastQueueCycleAt);
+  const requested = Number.isFinite(requestedMs) ? requestedMs : 0;
+  const run = Number.isFinite(runMs) ? runMs : 0;
+  const queueCycle = Number.isFinite(queueCycleMs) ? queueCycleMs : 0;
+  return Math.max(requested, run, queueCycle);
+}
+
+function ensureBulkHarvestStateRecord() {
+  if (!bulkStateFile || typeof bulkStateFile !== "object") {
+    bulkStateFile = { version: 1, updatedAt: "", states: {}, harvest: defaultBulkHarvestState(), seenStatusIds: [] };
+  }
+  bulkStateFile.harvest = normalizeBulkHarvestState(bulkStateFile.harvest);
+  return bulkStateFile.harvest;
 }
 
 function normalizeBulkAccount(raw) {
@@ -1297,6 +1364,14 @@ function resetBulkFollowJob() {
     stopRequested: false,
     accountsTotal: 0,
     accountsDone: 0,
+    autoRestartAfterHarvest: false,
+    pendingQueueCycleHarvest: false,
+    stopReason: "",
+    queueCycleRequestedAt: "",
+    queueCycleGeneration: 0,
+    queueCycleCompletedAccounts: 0,
+    queueCycleAccountsTotal: 0,
+    restartMaxPerAccount: 0,
   };
   bulkFollowStopRequested = false;
 }
@@ -1304,6 +1379,64 @@ function resetBulkFollowJob() {
 function setBulkFollowStopRequested() {
   bulkFollowStopRequested = true;
   bulkFollowJob.stopRequested = true;
+}
+
+function clearBulkFollowQueueCycleRequest() {
+  bulkFollowJob.autoRestartAfterHarvest = false;
+  bulkFollowJob.pendingQueueCycleHarvest = false;
+  if (safeString(bulkFollowJob.stopReason).trim() === "queue_cycle_harvest") bulkFollowJob.stopReason = "";
+  bulkFollowJob.queueCycleRequestedAt = "";
+  bulkFollowJob.queueCycleGeneration = 0;
+  bulkFollowJob.queueCycleCompletedAccounts = 0;
+  bulkFollowJob.queueCycleAccountsTotal = 0;
+  bulkFollowJob.restartMaxPerAccount = 0;
+}
+
+function requestQueueCycleHarvest(options = {}) {
+  const opt = options && typeof options === "object" ? options : {};
+  if (bulkFollowJob?.pendingQueueCycleHarvest) return { ok: false, reason: "pending" };
+  if (!bulkConfig?.harvestEnabled) return { ok: false, reason: "harvest_disabled" };
+  if (getBulkHarvestRepeatStrategy() !== "queue_cycle") return { ok: false, reason: "strategy_disabled" };
+
+  const keywords = parseHarvestKeywords(bulkConfig?.harvestKeywordsText || "");
+  if (keywords.length === 0) return { ok: false, reason: "keywords_empty" };
+
+  const harvest = ensureBulkHarvestStateRecord();
+  const minIntervalMs = getBulkHarvestMinIntervalSec() * 1000;
+  const referenceMs = getBulkHarvestReferenceTimeMs(harvest);
+  const nowMs = Date.now();
+  if (referenceMs > 0 && nowMs - referenceMs < minIntervalMs) {
+    return {
+      ok: false,
+      reason: "min_interval",
+      remainingMs: Math.max(0, minIntervalMs - (nowMs - referenceMs)),
+    };
+  }
+
+  const requestedAt = nowIso();
+  harvest.lastRequestedAt = requestedAt;
+  harvest.lastTrigger = "queue_cycle";
+  harvest.lastQueueCycleAt = requestedAt;
+  harvest.lastError = "";
+  markBulkStateDirty("harvest_queue_cycle_requested");
+
+  bulkFollowJob.pendingQueueCycleHarvest = true;
+  bulkFollowJob.autoRestartAfterHarvest = true;
+  bulkFollowJob.stopReason = "queue_cycle_harvest";
+  bulkFollowJob.queueCycleRequestedAt = requestedAt;
+  bulkFollowJob.queueCycleGeneration = Math.max(1, Math.round(Number(opt.generation) || 1));
+  bulkFollowJob.queueCycleCompletedAccounts = Math.max(0, Math.round(Number(opt.completedAccounts) || 0));
+  bulkFollowJob.queueCycleAccountsTotal = Math.max(0, Math.round(Number(opt.accountsTotal) || 0));
+  bulkFollowJob.restartMaxPerAccount = Math.max(
+    1,
+    Math.min(BULK_FOLLOW_COMMENTERS_DAILY_LIMIT, Math.round(Number(opt.maxPerAccount) || bulkFollowJob.maxPerAccount || 30)),
+  );
+
+  addBulkLog(
+    `[采集] 请求 queue_cycle 补采 generation=${bulkFollowJob.queueCycleGeneration} accounts=${bulkFollowJob.queueCycleCompletedAccounts}/${bulkFollowJob.queueCycleAccountsTotal} account=${safeString(opt.accountLabel).trim()} url=${safeString(opt.url).trim()}`,
+  );
+  setBulkFollowStopRequested();
+  return { ok: true, reason: "scheduled", requestedAt };
 }
 
 function isChromeUserDataDirInUseError(err) {
@@ -3012,6 +3145,7 @@ async function runBulkFollowCommenters(tweetUrl, options = {}) {
   bulkFollowJob.startedAt = nowIso();
   bulkFollowJob.finishedAt = "";
   bulkFollowJob.accountsDone = 0;
+  clearBulkFollowQueueCycleRequest();
 
   const accounts = getBulkAccounts().filter((a) => Boolean(a?.followCommentersEnabled) && Boolean(safeString(a?.id).trim()));
   bulkFollowJob.accountsTotal = accounts.length;
@@ -3158,6 +3292,7 @@ async function runBulkFollowCommentersQueueLoop(options = {}) {
   bulkFollowJob.finishedAt = "";
   bulkFollowJob.accountsTotal = accounts.length;
   bulkFollowJob.accountsDone = 0;
+  clearBulkFollowQueueCycleRequest();
 
   addBulkLog(
     `[关注] 开始队列 accounts=${accounts.length} concurrency=${followConcurrency} jitter=${followJitterSec}s perUrl=本次每号${maxPerAccount} wait=${followWaitSec}s preDelay=${followActionDelaySec}s cooldownEvery=${followCooldownEvery} cooldown=${followCooldownSec}s idle=${followIdleSleepSec}s`,
@@ -3167,6 +3302,9 @@ async function runBulkFollowCommentersQueueLoop(options = {}) {
     const total = accounts.length;
     const concurrency = Math.min(Math.max(1, followConcurrency), total || 1);
     let inUse = 0;
+    const queueCycleAccountIds = accounts.map((a) => safeString(a?.id).trim()).filter(Boolean);
+    const queueCycleRounds = new Map(queueCycleAccountIds.map((id) => [id, 0]));
+    let queueCycleTargetGeneration = 1;
 
     const acquireSlot = async () => {
       while (!isBulkFollowStopRequested()) {
@@ -3227,11 +3365,13 @@ async function runBulkFollowCommentersQueueLoop(options = {}) {
 
               const idx = Math.max(0, Math.round(Number(state.followQueueIndex) || 0)) % urls.length;
               const url = safeString(urls[idx]).trim();
+              let processedQueueUrl = false;
               if (!url) {
                 state.followQueueIndex = (idx + 1) % urls.length;
                 postDelayReason = "idle_queue_item_empty";
                 postDelayMs = followIdleSleepSec * 1000;
               } else {
+                processedQueueUrl = true;
                 bulkFollowJob.tweetUrl = url;
                 bulkFollowJob.currentUrl = url;
                 state.followQueueIndex = idx;
@@ -3297,6 +3437,50 @@ async function runBulkFollowCommentersQueueLoop(options = {}) {
               const nextIdx = urls.length > 0 ? (idx + 1) % urls.length : 0;
               state.followQueueIndex = nextIdx;
               markBulkStateDirty("queue_index");
+              if (processedQueueUrl && urls.length > 0 && nextIdx === 0 && queueCycleAccountIds.length > 0) {
+                const completedRounds = Math.max(0, Math.round(Number(queueCycleRounds.get(id)) || 0)) + 1;
+                queueCycleRounds.set(id, completedRounds);
+
+                const allCompleted = queueCycleAccountIds.every(
+                  (accountId) => Math.max(0, Math.round(Number(queueCycleRounds.get(accountId)) || 0)) >= queueCycleTargetGeneration,
+                );
+
+                if (allCompleted) {
+                  const queueCycleRequest = requestQueueCycleHarvest({
+                    generation: queueCycleTargetGeneration,
+                    completedAccounts: queueCycleAccountIds.length,
+                    accountsTotal: queueCycleAccountIds.length,
+                    maxPerAccount,
+                    accountLabel: safeString(a?.name || a?.id),
+                    url,
+                  });
+
+                  if (queueCycleRequest.ok) {
+                    postDelayReason = "queue_cycle_harvest";
+                    postDelayMs = 0;
+                  } else if (queueCycleRequest.reason === "min_interval") {
+                    addBulkLog(
+                      `[采集][DBG] 跳过 queue_cycle 补采：冷却未到 remaining=${Math.max(
+                        0,
+                        Math.round(Number(queueCycleRequest.remainingMs || 0) / 1000),
+                      )}s generation=${queueCycleTargetGeneration}`,
+                    );
+                    queueCycleTargetGeneration += 1;
+                  } else if (
+                    queueCycleRequest.reason !== "strategy_disabled" &&
+                    queueCycleRequest.reason !== "harvest_disabled" &&
+                    queueCycleRequest.reason !== "keywords_empty" &&
+                    queueCycleRequest.reason !== "pending"
+                  ) {
+                    addBulkLog(
+                      `[采集][DBG] 跳过 queue_cycle 补采 reason=${safeString(queueCycleRequest.reason).trim() || "unknown"} generation=${queueCycleTargetGeneration}`,
+                    );
+                    queueCycleTargetGeneration += 1;
+                  } else {
+                    queueCycleTargetGeneration += 1;
+                  }
+                }
+              }
               if (urls.length > 1) {
                 const nextUrl = safeString(urls[nextIdx]).trim();
                 if (nextUrl) {
@@ -3328,11 +3512,35 @@ async function runBulkFollowCommentersQueueLoop(options = {}) {
     const loops = accounts.map((a) => runAccountLoop(a));
     await Promise.all(loops);
   } finally {
+    const shouldRunQueueCycleHarvest = bulkFollowJob.autoRestartAfterHarvest === true;
+    const queueCycleMaxPerAccount = Math.max(
+      1,
+      Math.min(BULK_FOLLOW_COMMENTERS_DAILY_LIMIT, Math.round(Number(bulkFollowJob.restartMaxPerAccount) || maxPerAccount)),
+    );
     bulkFollowJob.running = false;
     bulkFollowJob.finishedAt = nowIso();
 
-    if (isBulkFollowStopRequested()) addBulkLog("[关注] 已停止");
+    if (shouldRunQueueCycleHarvest) addBulkLog("[关注] 队列轮次已完成，准备执行 queue_cycle 补采");
+    else if (isBulkFollowStopRequested()) addBulkLog("[关注] 已停止");
     else addBulkLog("[关注] 全部账号已完成");
+
+    if (shouldRunQueueCycleHarvest) {
+      try {
+        await runBulkHarvestAndMaybeStartFollow({
+          trigger: "queue_cycle",
+          keywords: parseHarvestKeywords(bulkConfig?.harvestKeywordsText || ""),
+          mode: bulkConfig?.harvestMode || "live",
+          limitPerKeyword: bulkConfig?.harvestLimitPerKeyword || 20,
+          autoStart: true,
+          maxPerAccount: queueCycleMaxPerAccount,
+        });
+      } catch (e) {
+        const err = safeString(e?.message || e);
+        addBulkLog(`[采集] queue_cycle 补采失败：${err}`);
+      } finally {
+        clearBulkFollowQueueCycleRequest();
+      }
+    }
   }
 }
 
@@ -3489,6 +3697,7 @@ async function runBulkHarvestAndMaybeStartFollow(options = {}) {
   const autoStart = opt.autoStart === undefined ? Boolean(bulkConfig?.harvestAutoStart) : Boolean(opt.autoStart);
   const trigger = safeString(opt.trigger || "manual").trim() || "manual";
   const startMaxPerAccount = Math.max(1, Math.min(BULK_FOLLOW_COMMENTERS_DAILY_LIMIT, Math.round(Number(opt.maxPerAccount) || 30)));
+  const requestedAt = nowIso();
 
   if (bulkSearchHarvestJob?.running) throw new Error("采集任务正在运行中");
   if (bulkFollowJob?.running) throw new Error("关注任务运行中：为避免浏览器 Profile 冲突，请先停止关注任务再采集");
@@ -3506,10 +3715,17 @@ async function runBulkHarvestAndMaybeStartFollow(options = {}) {
   if (!profileDir) throw new Error("Profile 目录解析失败");
 
   const proxyUrl = getBulkProxyUrl(pick);
+  const harvestState = ensureBulkHarvestStateRecord();
+  harvestState.lastRequestedAt = requestedAt;
+  harvestState.lastTrigger = trigger;
+  if (trigger === "queue_cycle") harvestState.lastQueueCycleAt = requestedAt;
+  markBulkStateDirty(`harvest_requested:${trigger}`);
 
   bulkSearchHarvestJob.running = true;
   bulkSearchHarvestJob.startedAt = nowIso();
   bulkSearchHarvestJob.finishedAt = "";
+  bulkSearchHarvestJob.trigger = trigger;
+  bulkSearchHarvestJob.requestedAt = requestedAt;
   bulkSearchHarvestJob.keywords = keywords;
   bulkSearchHarvestJob.mode = mode;
   bulkSearchHarvestJob.limitPerKeyword = limitPerKeyword;
@@ -3595,16 +3811,19 @@ async function runBulkHarvestAndMaybeStartFollow(options = {}) {
       seenIds.add(id);
     }
     bulkStateFile.seenStatusIds = Array.from(seenIds).slice(-20000);
-    bulkStateFile.harvest = bulkStateFile.harvest && typeof bulkStateFile.harvest === "object" ? bulkStateFile.harvest : {};
-    bulkStateFile.harvest.lastRunAt = nowIso();
-    bulkStateFile.harvest.lastError = "";
-    bulkStateFile.harvest.lastAdded = Number(addRes.added || 0);
+    const harvest = ensureBulkHarvestStateRecord();
+    harvest.lastRunAt = nowIso();
+    harvest.lastError = "";
+    harvest.lastAdded = Number(addRes.added || 0);
+    harvest.lastTrigger = trigger;
+    harvest.lastRequestedAt = requestedAt;
+    if (trigger === "queue_cycle") harvest.lastQueueCycleAt = requestedAt;
     markBulkStateDirty("harvest_run");
 
     bulkSearchHarvestJob.added = Number(addRes.added || 0);
     bulkSearchHarvestJob.totalQueue = Number(addRes.total || 0);
 
-    addBulkLog(`[采集] 完成 added=${addRes.added} queue=${beforeTotal} -> ${addRes.total}`);
+    addBulkLog(`[采集] 完成 trigger=${trigger} added=${addRes.added} queue=${beforeTotal} -> ${addRes.total}`);
 
     if (autoStart && !bulkFollowJob?.running) {
       addBulkLog("[采集] 已自动开始关注（队列模式）");
@@ -3618,9 +3837,12 @@ async function runBulkHarvestAndMaybeStartFollow(options = {}) {
   } catch (e) {
     const err = safeString(e?.message || e);
     bulkSearchHarvestJob.lastError = err;
-    bulkStateFile.harvest = bulkStateFile.harvest && typeof bulkStateFile.harvest === "object" ? bulkStateFile.harvest : {};
-    bulkStateFile.harvest.lastRunAt = nowIso();
-    bulkStateFile.harvest.lastError = err;
+    const harvest = ensureBulkHarvestStateRecord();
+    harvest.lastRunAt = nowIso();
+    harvest.lastError = err;
+    harvest.lastTrigger = trigger;
+    harvest.lastRequestedAt = requestedAt;
+    if (trigger === "queue_cycle") harvest.lastQueueCycleAt = requestedAt;
     markBulkStateDirty("harvest_error");
     throw e;
   } finally {
@@ -3635,6 +3857,7 @@ function startBulkHarvestScheduler() {
   bulkHarvestTimer = setInterval(() => {
     try {
       if (!bulkConfig?.harvestEnabled) return;
+      if (getBulkHarvestRepeatStrategy() !== "daily") return;
       const keywords = parseHarvestKeywords(bulkConfig?.harvestKeywordsText || "");
       if (keywords.length === 0) return;
       if (bulkFollowJob?.running) return;
@@ -3653,15 +3876,16 @@ function startBulkHarvestScheduler() {
         maxPerAccount: 30,
       })
         .then(() => {
-          bulkStateFile.harvest = bulkStateFile.harvest && typeof bulkStateFile.harvest === "object" ? bulkStateFile.harvest : {};
-          bulkStateFile.harvest.lastDailyKey = today;
+          const harvest = ensureBulkHarvestStateRecord();
+          harvest.lastDailyKey = today;
           markBulkStateDirty("harvest_daily_key");
         })
         .catch((e) => {
           const err = safeString(e?.message || e);
-          bulkStateFile.harvest = bulkStateFile.harvest && typeof bulkStateFile.harvest === "object" ? bulkStateFile.harvest : {};
-          bulkStateFile.harvest.lastRunAt = nowIso();
-          bulkStateFile.harvest.lastError = err;
+          const harvest = ensureBulkHarvestStateRecord();
+          harvest.lastRunAt = nowIso();
+          harvest.lastError = err;
+          harvest.lastTrigger = "daily";
           markBulkStateDirty("harvest_daily_error");
           addBulkLog(`[采集] 每日采集失败：${err}`);
         });
@@ -3842,6 +4066,11 @@ function normalizeBulkConfig(raw) {
   normalizedInput.harvestLimitPerKeyword = Number.isFinite(harvestLimitPerKeyword) ? Math.max(1, Math.min(200, harvestLimitPerKeyword)) : 20;
   normalizedInput.harvestEnabled = Boolean(normalizedInput.harvestEnabled);
   normalizedInput.harvestAutoStart = normalizedInput.harvestAutoStart === undefined ? true : Boolean(normalizedInput.harvestAutoStart);
+  normalizedInput.harvestRepeatStrategy = getBulkHarvestRepeatStrategy(normalizedInput);
+  const harvestMinIntervalSec = Math.round(Number(normalizedInput.harvestMinIntervalSec ?? DEFAULT_BULK_HARVEST_MIN_INTERVAL_SEC));
+  normalizedInput.harvestMinIntervalSec = Number.isFinite(harvestMinIntervalSec)
+    ? Math.max(60, Math.min(86400, harvestMinIntervalSec))
+    : DEFAULT_BULK_HARVEST_MIN_INTERVAL_SEC;
 
   // 代理按账号配置（account.proxy），不再使用全局默认/代理池
   delete normalizedInput.defaultProxy;
@@ -3902,7 +4131,7 @@ async function ensureDataFiles() {
   }
 
   if (!(await fileExists(BULK_STATE_PATH))) {
-    await writeJson(BULK_STATE_PATH, { version: 1, updatedAt: nowIso(), states: {}, harvest: { lastDailyKey: "", lastRunAt: "", lastError: "" }, seenStatusIds: [] });
+    await writeJson(BULK_STATE_PATH, { version: 1, updatedAt: nowIso(), states: {}, harvest: defaultBulkHarvestState(), seenStatusIds: [] });
   }
 }
 
@@ -4624,7 +4853,7 @@ let bulkConfigFile = null;
 let bulkRunning = false;
 const bulkTimers = new Map(); // accountId -> Timeout
 const bulkStates = new Map(); // accountId -> state
-let bulkStateFile = { version: 1, updatedAt: "", states: {}, harvest: { lastDailyKey: "", lastRunAt: "", lastError: "", lastAdded: 0 }, seenStatusIds: [] };
+let bulkStateFile = { version: 1, updatedAt: "", states: {}, harvest: defaultBulkHarvestState(), seenStatusIds: [] };
 let bulkStateDirty = false;
 let bulkStateSaveTimer = null;
 
@@ -4632,6 +4861,8 @@ let bulkSearchHarvestJob = {
   running: false,
   startedAt: "",
   finishedAt: "",
+  trigger: "",
+  requestedAt: "",
   keywords: [],
   mode: "",
   limitPerKeyword: 0,
@@ -4656,6 +4887,14 @@ let bulkFollowJob = {
   stopRequested: false,
   accountsTotal: 0,
   accountsDone: 0,
+  autoRestartAfterHarvest: false,
+  pendingQueueCycleHarvest: false,
+  stopReason: "",
+  queueCycleRequestedAt: "",
+  queueCycleGeneration: 0,
+  queueCycleCompletedAccounts: 0,
+  queueCycleAccountsTotal: 0,
+  restartMaxPerAccount: 0,
 };
 let bulkFollowStopRequested = false;
 let bulkFollowUrlsUpdatedAt = "";
@@ -4867,7 +5106,7 @@ async function flushBulkStateFile(reason) {
   next.version = 1;
   next.updatedAt = nowIso();
   next.states = snapshotBulkStatesForSave();
-  if (!next.harvest || typeof next.harvest !== "object") next.harvest = { lastDailyKey: "", lastRunAt: "", lastError: "", lastAdded: 0 };
+  next.harvest = normalizeBulkHarvestState(next.harvest);
   if (!Array.isArray(next.seenStatusIds)) next.seenStatusIds = [];
   // 上限裁剪：避免“每天采集”长期累积过大
   if (next.seenStatusIds.length > 20000) next.seenStatusIds = next.seenStatusIds.slice(-20000);
@@ -4883,6 +5122,8 @@ async function loadBulkStateFile() {
   if (!file) return;
 
   bulkStateFile = file;
+  bulkStateFile.harvest = normalizeBulkHarvestState(file.harvest);
+  if (!Array.isArray(bulkStateFile.seenStatusIds)) bulkStateFile.seenStatusIds = [];
   const states = file.states && typeof file.states === "object" ? file.states : {};
   for (const [id, st] of Object.entries(states)) {
     if (!id || !st || typeof st !== "object") continue;
@@ -5927,11 +6168,9 @@ async function main() {
   await loadBulkStateFile();
   // 载入后确保结构健全，避免旧文件缺字段导致 500
   if (!bulkStateFile || typeof bulkStateFile !== "object") {
-    bulkStateFile = { version: 1, updatedAt: nowIso(), states: {}, harvest: { lastDailyKey: "", lastRunAt: "", lastError: "", lastAdded: 0 }, seenStatusIds: [] };
+    bulkStateFile = { version: 1, updatedAt: nowIso(), states: {}, harvest: defaultBulkHarvestState(), seenStatusIds: [] };
   }
-  if (!bulkStateFile.harvest || typeof bulkStateFile.harvest !== "object") {
-    bulkStateFile.harvest = { lastDailyKey: "", lastRunAt: "", lastError: "", lastAdded: 0 };
-  }
+  bulkStateFile.harvest = normalizeBulkHarvestState(bulkStateFile.harvest);
   if (!Array.isArray(bulkStateFile.seenStatusIds)) bulkStateFile.seenStatusIds = [];
   startBulkHarvestScheduler();
 
@@ -6614,7 +6853,7 @@ async function main() {
     res.json({
       ok: true,
       job: bulkSearchHarvestJob,
-      harvest: bulkStateFile?.harvest || { lastDailyKey: "", lastRunAt: "", lastError: "", lastAdded: 0 },
+      harvest: normalizeBulkHarvestState(bulkStateFile?.harvest),
     });
   });
 

@@ -99,11 +99,24 @@ async function main() {
     const cfg0 = await httpJson(`${base}/api/bulk/config`);
     assert(cfg0.ok && cfg0.json?.config, "读取 bulk config 失败");
 
+    const cfgQueueCycle = {
+      ...cfg0.json.config,
+      harvestRepeatStrategy: "queue_cycle",
+      harvestMinIntervalSec: 900,
+    };
+    const saveQueueCycle = await httpJson(`${base}/api/bulk/config`, { method: "POST", body: JSON.stringify(cfgQueueCycle) });
+    assert(saveQueueCycle.ok && saveQueueCycle.json?.config, "保存 queue_cycle harvest 配置失败");
+    assert(saveQueueCycle.json.config?.harvestRepeatStrategy === "queue_cycle", "harvestRepeatStrategy 未保存为 queue_cycle");
+    assert(saveQueueCycle.json.config?.harvestMinIntervalSec === 900, "harvestMinIntervalSec 未保存为 900");
+
     const harvest0 = await httpJson(`${base}/api/bulk/search-harvest/status`);
     assert(harvest0.ok && harvest0.json?.ok === true, "读取 harvest status 失败");
     assert(harvest0.json?.job && typeof harvest0.json.job === "object", "harvest status.job 缺失");
     assert(harvest0.json?.harvest && typeof harvest0.json.harvest === "object", "harvest status.harvest 缺失");
     assert(harvest0.json.harvest.lastAdded !== undefined, "harvest status.harvest.lastAdded 缺失");
+    assert(harvest0.json.harvest.lastTrigger !== undefined, "harvest status.harvest.lastTrigger 缺失");
+    assert(harvest0.json.harvest.lastRequestedAt !== undefined, "harvest status.harvest.lastRequestedAt 缺失");
+    assert(harvest0.json.harvest.lastQueueCycleAt !== undefined, "harvest status.harvest.lastQueueCycleAt 缺失");
 
     // 保证本脚本不会意外触发浏览器：强制 followUrls 为空
     const cfgNoUrls = { ...cfg0.json.config, followUrls: [] };
