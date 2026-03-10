@@ -673,8 +673,25 @@ async function followCommentersStart() {
   const followWaitSec = Number(byId("followWaitSec")?.value || 18);
   const followConcurrency = Number(byId("followConcurrency")?.value || 1);
   const followJitterSec = Number(byId("followJitterSec")?.value || 4);
+  const followActionDelaySec = Number(byId("followActionDelaySec")?.value || 0);
+  const followCooldownEvery = Number(byId("followCooldownEvery")?.value || 0);
+  const followCooldownSec = Number(byId("followCooldownSec")?.value || 0);
+  const followIdleSleepSec = Number(byId("followIdleSleepSec")?.value || 30);
+  const followVisitCooldownEvery = Number(byId("followVisitCooldownEvery")?.value || 0);
+  const followVisitCooldownSec = Number(byId("followVisitCooldownSec")?.value || 0);
 
-  const body = { maxPerAccount, followWaitSec, followConcurrency, followJitterSec };
+  const body = {
+    maxPerAccount,
+    followWaitSec,
+    followConcurrency,
+    followJitterSec,
+    followActionDelaySec,
+    followCooldownEvery,
+    followCooldownSec,
+    followIdleSleepSec,
+    followVisitCooldownEvery,
+    followVisitCooldownSec,
+  };
   if (tweetUrl) body.tweetUrl = tweetUrl;
   const res = await api("/api/bulk/follow-commenters/start", {
     method: "POST",

@@ -1359,6 +1359,12 @@ function resetBulkFollowJob() {
     followWaitSec: 0,
     followConcurrency: 1,
     followJitterSec: 0,
+    followActionDelaySec: 0,
+    followCooldownEvery: 0,
+    followCooldownSec: 0,
+    followIdleSleepSec: 0,
+    followVisitCooldownEvery: 0,
+    followVisitCooldownSec: 0,
     startedAt: "",
     finishedAt: "",
     stopRequested: false,
@@ -3129,6 +3135,30 @@ async function runBulkFollowCommenters(tweetUrl, options = {}) {
   const followWaitSec = Math.max(3, Math.min(600, Math.round(Number(options?.followWaitSec ?? bulkConfig?.followWaitSec ?? 18) || 18)));
   const followConcurrency = Math.max(1, Math.min(6, Math.round(Number(options?.followConcurrency ?? bulkConfig?.followConcurrency ?? 1) || 1)));
   const followJitterSec = Math.max(0, Math.min(120, Math.round(Number(options?.followJitterSec ?? bulkConfig?.followJitterSec ?? 4) || 0)));
+  const followActionDelaySec = Math.max(
+    0,
+    Math.min(600, Math.round(Number(options?.followActionDelaySec ?? bulkConfig?.followActionDelaySec ?? 0) || 0)),
+  );
+  const followCooldownEvery = Math.max(
+    0,
+    Math.min(200, Math.round(Number(options?.followCooldownEvery ?? bulkConfig?.followCooldownEvery ?? 0) || 0)),
+  );
+  const followCooldownSec = Math.max(
+    0,
+    Math.min(3600, Math.round(Number(options?.followCooldownSec ?? bulkConfig?.followCooldownSec ?? 0) || 0)),
+  );
+  const followIdleSleepSec = Math.max(
+    5,
+    Math.min(3600, Math.round(Number(options?.followIdleSleepSec ?? bulkConfig?.followIdleSleepSec ?? 30) || 30)),
+  );
+  const followVisitCooldownEvery = Math.max(
+    0,
+    Math.min(1000, Math.round(Number(options?.followVisitCooldownEvery ?? bulkConfig?.followVisitCooldownEvery ?? 0) || 0)),
+  );
+  const followVisitCooldownSec = Math.max(
+    0,
+    Math.min(3600, Math.round(Number(options?.followVisitCooldownSec ?? bulkConfig?.followVisitCooldownSec ?? 0) || 0)),
+  );
 
   bulkFollowStopRequested = false;
   bulkFollowJob.running = true;
@@ -3142,6 +3172,12 @@ async function runBulkFollowCommenters(tweetUrl, options = {}) {
   bulkFollowJob.followWaitSec = followWaitSec;
   bulkFollowJob.followConcurrency = followConcurrency;
   bulkFollowJob.followJitterSec = followJitterSec;
+  bulkFollowJob.followActionDelaySec = followActionDelaySec;
+  bulkFollowJob.followCooldownEvery = followCooldownEvery;
+  bulkFollowJob.followCooldownSec = followCooldownSec;
+  bulkFollowJob.followIdleSleepSec = followIdleSleepSec;
+  bulkFollowJob.followVisitCooldownEvery = followVisitCooldownEvery;
+  bulkFollowJob.followVisitCooldownSec = followVisitCooldownSec;
   bulkFollowJob.startedAt = nowIso();
   bulkFollowJob.finishedAt = "";
   bulkFollowJob.accountsDone = 0;
@@ -3196,7 +3232,16 @@ async function runBulkFollowCommenters(tweetUrl, options = {}) {
       }
 
       try {
-        const r = await bulkFollowCommentersForAccount(a, url, { remainDaily, maxFollow: remain, followWaitSec });
+        const r = await bulkFollowCommentersForAccount(a, url, {
+          remainDaily,
+          maxFollow: remain,
+          followWaitSec,
+          followActionDelaySec,
+          followCooldownEvery,
+          followCooldownSec,
+          followVisitCooldownEvery,
+          followVisitCooldownSec,
+        });
         state.followDone = Number(r?.followed || 0);
         state.followSkipped = Number(r?.skipped || 0);
         state.followWarnings = Number(r?.warnings || 0);
@@ -3272,6 +3317,14 @@ async function runBulkFollowCommentersQueueLoop(options = {}) {
     Math.min(3600, Math.round(Number(options?.followCooldownSec ?? bulkConfig?.followCooldownSec ?? 0) || 0)),
   );
   const followIdleSleepSec = Math.max(5, Math.min(3600, Math.round(Number(options?.followIdleSleepSec ?? bulkConfig?.followIdleSleepSec ?? 30) || 30)));
+  const followVisitCooldownEvery = Math.max(
+    0,
+    Math.min(1000, Math.round(Number(options?.followVisitCooldownEvery ?? bulkConfig?.followVisitCooldownEvery ?? 0) || 0)),
+  );
+  const followVisitCooldownSec = Math.max(
+    0,
+    Math.min(3600, Math.round(Number(options?.followVisitCooldownSec ?? bulkConfig?.followVisitCooldownSec ?? 0) || 0)),
+  );
 
   const accounts = getBulkAccounts().filter((a) => Boolean(a?.followCommentersEnabled) && Boolean(safeString(a?.id).trim()));
   if (accounts.length === 0) throw new Error("没有可执行账号：请在账号里勾选「关注评论」");
@@ -3288,6 +3341,12 @@ async function runBulkFollowCommentersQueueLoop(options = {}) {
   bulkFollowJob.followWaitSec = followWaitSec;
   bulkFollowJob.followConcurrency = followConcurrency;
   bulkFollowJob.followJitterSec = followJitterSec;
+  bulkFollowJob.followActionDelaySec = followActionDelaySec;
+  bulkFollowJob.followCooldownEvery = followCooldownEvery;
+  bulkFollowJob.followCooldownSec = followCooldownSec;
+  bulkFollowJob.followIdleSleepSec = followIdleSleepSec;
+  bulkFollowJob.followVisitCooldownEvery = followVisitCooldownEvery;
+  bulkFollowJob.followVisitCooldownSec = followVisitCooldownSec;
   bulkFollowJob.startedAt = nowIso();
   bulkFollowJob.finishedAt = "";
   bulkFollowJob.accountsTotal = accounts.length;
@@ -3404,11 +3463,13 @@ async function runBulkFollowCommentersQueueLoop(options = {}) {
                   const r = await bulkFollowCommentersForAccount(a, url, {
                     remainDaily,
                     maxFollow: remain,
-                  followWaitSec,
-                  followActionDelaySec,
-                  followCooldownEvery,
-                  followCooldownSec,
-                });
+                    followWaitSec,
+                    followActionDelaySec,
+                    followCooldownEvery,
+                    followCooldownSec,
+                    followVisitCooldownEvery,
+                    followVisitCooldownSec,
+                  });
                 state.followDone = Number(r?.followed || 0);
                 state.followSkipped = Number(r?.skipped || 0);
                 state.followWarnings = Number(r?.warnings || 0);
@@ -4882,6 +4943,12 @@ let bulkFollowJob = {
   followWaitSec: 0,
   followConcurrency: 1,
   followJitterSec: 0,
+  followActionDelaySec: 0,
+  followCooldownEvery: 0,
+  followCooldownSec: 0,
+  followIdleSleepSec: 0,
+  followVisitCooldownEvery: 0,
+  followVisitCooldownSec: 0,
   startedAt: "",
   finishedAt: "",
   stopRequested: false,
@@ -6891,6 +6958,12 @@ async function main() {
       const followWaitSec = req.body?.followWaitSec;
       const followConcurrency = req.body?.followConcurrency;
       const followJitterSec = req.body?.followJitterSec;
+      const followActionDelaySec = req.body?.followActionDelaySec;
+      const followCooldownEvery = req.body?.followCooldownEvery;
+      const followCooldownSec = req.body?.followCooldownSec;
+      const followIdleSleepSec = req.body?.followIdleSleepSec;
+      const followVisitCooldownEvery = req.body?.followVisitCooldownEvery;
+      const followVisitCooldownSec = req.body?.followVisitCooldownSec;
 
       if (bulkFollowJob?.running) return res.status(409).json({ error: "关注任务正在运行中" });
 
@@ -6910,7 +6983,19 @@ async function main() {
 
       // 启动后台任务（不阻塞接口）
       const starter = tweetUrlRaw ? "once" : "queue";
-      const startTask = starter === "once" ? runBulkFollowCommenters(url, { maxPerAccount, followWaitSec, followConcurrency, followJitterSec }) : runBulkFollowCommentersQueueLoop({ maxPerAccount, followWaitSec, followConcurrency, followJitterSec });
+      const startOptions = {
+        maxPerAccount,
+        followWaitSec,
+        followConcurrency,
+        followJitterSec,
+        followActionDelaySec,
+        followCooldownEvery,
+        followCooldownSec,
+        followIdleSleepSec,
+        followVisitCooldownEvery,
+        followVisitCooldownSec,
+      };
+      const startTask = starter === "once" ? runBulkFollowCommenters(url, startOptions) : runBulkFollowCommentersQueueLoop(startOptions);
       startTask.catch((e) => {
         const err = safeString(e?.message || e);
         addBulkLog(`[关注] 全局任务异常：${err}`);

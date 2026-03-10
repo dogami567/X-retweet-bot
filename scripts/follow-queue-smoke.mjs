@@ -132,8 +132,22 @@ async function main() {
     assert(queue0.json?.currentUrl !== undefined, "follow-urls.currentUrl 缺失");
     assert(Array.isArray(queue0.json?.stats), "follow-urls.stats 不是数组");
 
-    const start = await httpJson(`${base}/api/bulk/follow-commenters/start`, { method: "POST", body: "{}" });
+    const startBody = {
+      followActionDelaySec: 7,
+      followCooldownEvery: 11,
+      followCooldownSec: 13,
+      followIdleSleepSec: 9,
+      followVisitCooldownEvery: 5,
+      followVisitCooldownSec: 15,
+    };
+    const start = await httpJson(`${base}/api/bulk/follow-commenters/start`, { method: "POST", body: JSON.stringify(startBody) });
     assert(start.ok && start.json?.ok === true, "启动关注队列失败");
+    assert(start.json?.job?.followActionDelaySec === 7, "start.job.followActionDelaySec 未生效");
+    assert(start.json?.job?.followCooldownEvery === 11, "start.job.followCooldownEvery 未生效");
+    assert(start.json?.job?.followCooldownSec === 13, "start.job.followCooldownSec 未生效");
+    assert(start.json?.job?.followIdleSleepSec === 9, "start.job.followIdleSleepSec 未生效");
+    assert(start.json?.job?.followVisitCooldownEvery === 5, "start.job.followVisitCooldownEvery 未生效");
+    assert(start.json?.job?.followVisitCooldownSec === 15, "start.job.followVisitCooldownSec 未生效");
 
     await sleep(800);
     const st1 = await httpJson(`${base}/api/bulk/follow-commenters/status`);
@@ -143,6 +157,12 @@ async function main() {
     assert(typeof q1.urlsTotal === "number", "status.queue.urlsTotal 缺失");
     assert(q1.sleepRemainingSec !== undefined, "status.queue.sleepRemainingSec 缺失");
     assert(q1.cooldownRemainingSec !== undefined, "status.queue.cooldownRemainingSec 缺失");
+    assert(st1.json?.job?.followActionDelaySec === 7, "status.job.followActionDelaySec 未透传");
+    assert(st1.json?.job?.followCooldownEvery === 11, "status.job.followCooldownEvery 未透传");
+    assert(st1.json?.job?.followCooldownSec === 13, "status.job.followCooldownSec 未透传");
+    assert(st1.json?.job?.followIdleSleepSec === 9, "status.job.followIdleSleepSec 未透传");
+    assert(st1.json?.job?.followVisitCooldownEvery === 5, "status.job.followVisitCooldownEvery 未透传");
+    assert(st1.json?.job?.followVisitCooldownSec === 15, "status.job.followVisitCooldownSec 未透传");
 
     await httpJson(`${base}/api/bulk/follow-commenters/stop`, { method: "POST", body: "{}" });
     await waitUntil(5000, async () => {
