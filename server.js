@@ -5796,10 +5796,16 @@ async function bulkTick(accountId, trigger) {
     state.running = false;
   }
 
-  const delayMs = computeBulkDelayMs(a.schedule);
+  const nextAccount = findBulkAccount(a.id);
+  if (!bulkRunning || !nextAccount?.enabled) {
+    state.nextPostAt = "";
+    return;
+  }
+
+  const delayMs = computeBulkDelayMs(nextAccount.schedule);
   const nextAt = new Date(Date.now() + delayMs).toISOString();
   state.nextPostAt = nextAt;
-  scheduleBulkNext(a.id, delayMs);
+  scheduleBulkNext(nextAccount.id, delayMs);
 }
 
 function scheduleBulkNext(accountId, delayMs) {
@@ -5811,10 +5817,79 @@ function scheduleBulkNext(accountId, delayMs) {
   if (prev) clearTimeout(prev);
 
   const t = setTimeout(() => {
+    bulkTimers.delete(id);
     bulkTick(id, "timer").catch(() => {});
   }, Math.max(1000, Math.round(Number(delayMs) || 0)));
 
   bulkTimers.set(id, t);
+}
+
+function clearBulkTimerForAccount(accountId, options = {}) {
+  const id = safeString(accountId).trim();
+  if (!id) return;
+  const prev = bulkTimers.get(id);
+  if (prev) clearTimeout(prev);
+  bulkTimers.delete(id);
+
+  if (options.clearNextPostAt === false) return;
+  const state = bulkStates.get(id);
+  if (state && !state.running) state.nextPostAt = "";
+}
+
+function getBulkScheduleSyncKey(account) {
+  const a = account && typeof account === "object" ? account : {};
+  const schedule = a.schedule && typeof a.schedule === "object" ? a.schedule : {};
+  const intervalMin = Number(schedule.intervalMin ?? 120);
+  const jitterMinFallback = schedule.jitterMin === undefined && schedule.jitterSec !== undefined ? Number(schedule.jitterSec) / 60 : undefined;
+  const jitterMin = Number(schedule.jitterMin ?? jitterMinFallback ?? 10);
+  return JSON.stringify({
+    enabled: Boolean(a.enabled),
+    intervalMin: Number.isFinite(intervalMin) ? intervalMin : null,
+    jitterMin: Number.isFinite(jitterMin) ? jitterMin : null,
+  });
+}
+
+function syncBulkSchedulerOnConfigSave(previousConfig) {
+  if (!bulkRunning) return;
+
+  stopBulkScanTimer();
+  startBulkScanTimer();
+
+  const prevAccounts = Array.isArray(previousConfig?.accounts) ? previousConfig.accounts : [];
+  const prevMap = new Map();
+  for (const account of prevAccounts) {
+    const id = safeString(account?.id).trim();
+    if (!id) continue;
+    prevMap.set(id, account);
+  }
+
+  for (const id of Array.from(bulkTimers.keys())) {
+    const nextAccount = findBulkAccount(id);
+    if (!nextAccount || !nextAccount.enabled) clearBulkTimerForAccount(id);
+  }
+
+  for (const account of getBulkAccounts()) {
+    const id = safeString(account?.id).trim();
+    if (!id) continue;
+
+    const state = upsertBulkState(id);
+    if (!state) continue;
+
+    if (!account.enabled) {
+      if (!state.running) state.nextPostAt = "";
+      continue;
+    }
+
+    if (state.running) continue;
+
+    const prevAccount = prevMap.get(id);
+    const scheduleChanged = !prevAccount || getBulkScheduleSyncKey(prevAccount) !== getBulkScheduleSyncKey(account);
+    if (!scheduleChanged && bulkTimers.has(id)) continue;
+
+    const delayMs = computeBulkDelayMs(account.schedule);
+    state.nextPostAt = new Date(Date.now() + delayMs).toISOString();
+    scheduleBulkNext(id, delayMs);
+  }
 }
 
 function startBulkScheduler() {
@@ -6834,9 +6909,7 @@ async function main() {
       const incoming = req.body || {};
       const nextFile = normalizeBulkConfig(incoming);
       const ensured2 = ensureBulkAccountIds(nextFile);
-
-      const wasRunning = bulkRunning;
-      if (wasRunning) stopBulkScheduler();
+      const previousConfig = bulkConfig ? JSON.parse(JSON.stringify(bulkConfig)) : null;
 
       bulkConfigFile = ensured2.config;
       await writeJson(BULK_CONFIG_PATH, bulkConfigFile);
@@ -6847,7 +6920,7 @@ async function main() {
       addBulkLog("[配置] 已保存");
 
       await scanBulkImages("config-save");
-      if (wasRunning) startBulkScheduler();
+      syncBulkSchedulerOnConfigSave(previousConfig);
 
       return res.json({ ok: true, config: bulkConfig });
     } catch (e) {
