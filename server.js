@@ -36,6 +36,11 @@ const express = require("express");
 const axios = require("axios/dist/node/axios.cjs");
 const { TwitterApi } = require("twitter-api-v2");
 const { HttpsProxyAgent } = require("https-proxy-agent");
+const {
+  evaluateBulkFollowCandidate,
+  normalizeBulkFollowCandidateProfile,
+  normalizeBulkFollowFilterRules,
+} = require("./lib/bulk-follow-filters");
 
 const PORT = Number(process.env.PORT || 3000);
 
@@ -582,6 +587,8 @@ function defaultBulkConfig() {
     // 0 表示不启用
     followVisitCooldownEvery: 0,
     followVisitCooldownSec: 0,
+    followRequireVerified: false,
+    followRequireChineseBio: false,
     // 账号一对一“已关注/已请求/受保护”等缓存：命中后不再访问主页，直接跳过
     followSkipCacheEnabled: true,
     followSkipCacheMax: 20000,
@@ -1728,6 +1735,99 @@ async function isProtectedProfilePage(page) {
     /受保护的推文/i.test(t) ||
     /只有经确认的关注者/i.test(t)
   );
+}
+
+function getBulkFollowFilterRules() {
+  return normalizeBulkFollowFilterRules({
+    requireVerified: bulkConfig?.followRequireVerified,
+    requireChineseBio: bulkConfig?.followRequireChineseBio,
+  });
+}
+
+async function readBulkFollowCandidateProfile(page, options = {}) {
+  const opt = options && typeof options === "object" ? options : {};
+  const fallbackHandle = safeString(opt.targetHandle).replace(/^@/, "").trim();
+  const fallbackUrl = safeString(opt.profileUrl).trim();
+  const maxAttempts = Math.max(1, Math.min(3, Math.round(Number(opt.maxAttempts) || 2)));
+  let last = normalizeBulkFollowCandidateProfile({ handle: fallbackHandle, verifiedKnown: false, bioKnown: false });
+
+  for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+    // eslint-disable-next-line no-await-in-loop
+    const snapshot = await pageEvaluateWithRetry(
+      page,
+      "follow(candidate_profile)",
+      (fallbackHandleValue, fallbackUrlValue) => {
+        const normalize = (value) => String(value || "").replace(/\s+/g, " ").trim();
+        const primary = document.querySelector('[data-testid="primaryColumn"]') || document;
+        const userNameRoots = Array.from(primary.querySelectorAll('[data-testid="UserName"]'));
+        const bioEl = primary.querySelector('[data-testid="UserDescription"]');
+        const handleLink = userNameRoots
+          .flatMap((root) => Array.from(root.querySelectorAll('a[href^="/"]')))
+          .find((el) => {
+            const href = String(el.getAttribute("href") || "").trim();
+            return /^\/[A-Za-z0-9_]{1,50}(?:\/)?$/i.test(href);
+          });
+
+        const handleFromHref = (() => {
+          const href = String(handleLink?.getAttribute("href") || "").trim();
+          const match = href.match(/^\/([A-Za-z0-9_]{1,50})(?:\/)?$/i);
+          if (match) return match[1];
+          const fallbackMatch = String(fallbackUrlValue || "").match(/x\.com\/([^\/?#]+)(?:\/|$)/i);
+          if (fallbackMatch) return String(fallbackMatch[1] || "").trim();
+          return String(fallbackHandleValue || "").trim().replace(/^@/, "");
+        })();
+
+        const verifiedRoot = userNameRoots.find((root) => {
+          const text = normalize(root.innerText || "");
+          const handleNeedle = handleFromHref ? `@${handleFromHref}`.toLowerCase() : "";
+          return handleNeedle ? text.toLowerCase().includes(handleNeedle) : text.length > 0;
+        });
+        const verified = Boolean(
+          (verifiedRoot || primary).querySelector(
+            '[data-testid="icon-verified"], [aria-label*="Verified account"], [aria-label*="已认证"], svg[aria-label*="Verified"], svg[aria-label*="已认证"]',
+          ),
+        );
+
+        const displayName = normalize(
+          userNameRoots
+            .map((root) => normalize(root.innerText || ""))
+            .find((text) => {
+              if (!text) return false;
+              if (!handleFromHref) return true;
+              return text.toLowerCase().includes(`@${handleFromHref}`.toLowerCase());
+            }) || "",
+        );
+
+        return {
+          handle: handleFromHref,
+          displayName,
+          bioText: normalize(bioEl ? bioEl.innerText || "" : ""),
+          verified,
+          verifiedKnown: Boolean(userNameRoots.length > 0),
+          bioKnown: Boolean(bioEl),
+        };
+      },
+      fallbackHandle,
+      fallbackUrl,
+    ).catch(() => null);
+
+    last = normalizeBulkFollowCandidateProfile({
+      handle: snapshot?.handle || fallbackHandle,
+      displayName: snapshot?.displayName || last.displayName,
+      bioText: snapshot?.bioText || last.bioText,
+      verified: snapshot?.verified === true,
+      verifiedKnown: snapshot?.verifiedKnown === true,
+      bioKnown: snapshot?.bioKnown === true,
+    });
+
+    if (last.verifiedKnown || last.bioKnown) return last;
+    if (attempt + 1 < maxAttempts) {
+      // eslint-disable-next-line no-await-in-loop
+      await sleepWithBulkFollowStop(250);
+    }
+  }
+
+  return last;
 }
 
 async function followUserFromProfile(page, options = {}) {
@@ -2965,6 +3065,8 @@ async function bulkFollowCommentersForAccount(account, tweetUrl, options = {}) {
         continue;
       }
 
+      const followFilterRules = getBulkFollowFilterRules();
+
       // eslint-disable-next-line no-await-in-loop
       let targetHandle = "";
       try {
@@ -2979,6 +3081,27 @@ async function bulkFollowCommentersForAccount(account, tweetUrl, options = {}) {
           if (h && /^[A-Za-z0-9_]{1,50}$/.test(h)) targetHandle = h;
         }
       } catch {}
+
+      if (followFilterRules.requireVerified || followFilterRules.requireChineseBio) {
+        // eslint-disable-next-line no-await-in-loop
+        const candidateProfile = await readBulkFollowCandidateProfile(actionPage, {
+          targetHandle: handleForCache || targetHandle,
+          profileUrl,
+          maxAttempts: 2,
+        }).catch(() => normalizeBulkFollowCandidateProfile({ handle: handleForCache || targetHandle, verifiedKnown: false, bioKnown: false }));
+
+        const candidateDecision = evaluateBulkFollowCandidate(candidateProfile, followFilterRules);
+        if (!candidateDecision.allow) {
+          summary.skipped += 1;
+          addBulkLog(
+            `[关注][DBG] 过滤跳过 account=${safeString(a.name || a.id)} user=${display} reason=${candidateDecision.skipReason} verified=${
+              candidateDecision.profile?.verified ? 1 : 0
+            } bioHasChinese=${candidateDecision.profile?.bioHasChinese ? 1 : 0}`,
+          );
+          if (handleForCache) recordBulkFollowSeenStatus(state, handleForCache, candidateDecision.skipReason);
+          continue;
+        }
+      }
 
       const r = await followUserFromProfile(actionPage, {
         targetHandle,
@@ -4115,6 +4238,8 @@ function normalizeBulkConfig(raw) {
   normalizedInput.followVisitCooldownEvery = Number.isFinite(followVisitCooldownEvery) ? Math.max(0, Math.min(1000, followVisitCooldownEvery)) : 0;
   const followVisitCooldownSec = Math.round(Number(normalizedInput.followVisitCooldownSec ?? 0));
   normalizedInput.followVisitCooldownSec = Number.isFinite(followVisitCooldownSec) ? Math.max(0, Math.min(3600, followVisitCooldownSec)) : 0;
+  normalizedInput.followRequireVerified = normalizedInput.followRequireVerified === true;
+  normalizedInput.followRequireChineseBio = normalizedInput.followRequireChineseBio === true;
 
   normalizedInput.followSkipCacheEnabled = normalizedInput.followSkipCacheEnabled === undefined ? true : Boolean(normalizedInput.followSkipCacheEnabled);
   const followSkipCacheMax = Math.round(Number(normalizedInput.followSkipCacheMax ?? 20000));

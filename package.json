@@ -11,6 +11,7 @@
     "package:exe": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/package-exe.ps1",
     "release:exe": "npm run build:exe && npm run package:exe",
     "smoke:bulk-config": "node scripts/bulk-config-smoke.mjs",
+    "smoke:follow-filter": "node scripts/follow-filter-smoke.mjs",
     "core-test": "node scripts/core-test.mjs",
     "smoke": "node scripts/smoke-test.mjs",
     "test:e2e": "playwright test"

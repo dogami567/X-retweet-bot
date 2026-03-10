@@ -80,6 +80,8 @@ async function main() {
     assert(Array.isArray(emptyCfg.followUrls) && emptyCfg.followUrls.length === 0, "空配置默认 followUrls 应为空数组");
     assert(Number(emptyCfg.followWaitSec) === 18, `空配置默认 followWaitSec 异常: ${emptyCfg.followWaitSec}`);
     assert(Number(emptyCfg.followIdleSleepSec) === 30, `空配置默认 followIdleSleepSec 异常: ${emptyCfg.followIdleSleepSec}`);
+    assert(emptyCfg.followRequireVerified === false, "空配置默认 followRequireVerified 应为 false");
+    assert(emptyCfg.followRequireChineseBio === false, "空配置默认 followRequireChineseBio 应为 false");
 
     const legacyPayload = {
       imageDir: "data/bulk-images",
@@ -89,6 +91,8 @@ async function main() {
       followCooldownEvery: -3,
       followCooldownSec: 7201,
       followIdleSleepSec: 1,
+      followRequireVerified: true,
+      followRequireChineseBio: true,
       captions: "hello\nworld",
       accounts: [],
     };
@@ -108,6 +112,8 @@ async function main() {
     assert(Number(cfg.followCooldownEvery) === 0, `followCooldownEvery 未按下限裁剪: ${cfg.followCooldownEvery}`);
     assert(Number(cfg.followCooldownSec) === 3600, `followCooldownSec 未按上限裁剪: ${cfg.followCooldownSec}`);
     assert(Number(cfg.followIdleSleepSec) === 5, `followIdleSleepSec 未按下限裁剪: ${cfg.followIdleSleepSec}`);
+    assert(cfg.followRequireVerified === true, "followRequireVerified 未返回 true");
+    assert(cfg.followRequireChineseBio === true, "followRequireChineseBio 未返回 true");
     assert(Array.isArray(cfg.captions) && cfg.captions.length === 2, "captions 字符串未正确拆分");
 
     const reread = await httpJson(`${base}/api/bulk/config`);
