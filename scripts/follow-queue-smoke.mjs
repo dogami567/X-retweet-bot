@@ -155,14 +155,21 @@ async function main() {
 
     const q1 = st1.json?.queue || {};
     assert(typeof q1.urlsTotal === "number", "status.queue.urlsTotal 缺失");
+    assert(typeof q1.followQueueIndex === "number", "status.queue.followQueueIndex 缺失");
+    assert(typeof q1.currentUrlIndex === "number", "status.queue.currentUrlIndex 缺失");
     assert(q1.sleepRemainingSec !== undefined, "status.queue.sleepRemainingSec 缺失");
     assert(q1.cooldownRemainingSec !== undefined, "status.queue.cooldownRemainingSec 缺失");
+    assert(q1.waitState !== undefined, "status.queue.waitState 缺失");
+    assert(q1.lastEndedBecause !== undefined, "status.queue.lastEndedBecause 缺失");
     assert(st1.json?.job?.followActionDelaySec === 7, "status.job.followActionDelaySec 未透传");
     assert(st1.json?.job?.followCooldownEvery === 11, "status.job.followCooldownEvery 未透传");
     assert(st1.json?.job?.followCooldownSec === 13, "status.job.followCooldownSec 未透传");
     assert(st1.json?.job?.followIdleSleepSec === 9, "status.job.followIdleSleepSec 未透传");
     assert(st1.json?.job?.followVisitCooldownEvery === 5, "status.job.followVisitCooldownEvery 未透传");
     assert(st1.json?.job?.followVisitCooldownSec === 15, "status.job.followVisitCooldownSec 未透传");
+    assert(q1.waitState === q1.sleepReason, "status.queue.waitState 与 sleepReason 不一致");
+    assert(q1.waitState === "idle_queue_empty", `空队列等待状态异常: ${q1.waitState}`);
+    assert(q1.lastEndedBecause === "idle_queue_empty", `空队列 endedBecause 异常: ${q1.lastEndedBecause}`);
 
     await httpJson(`${base}/api/bulk/follow-commenters/stop`, { method: "POST", body: "{}" });
     await waitUntil(5000, async () => {
